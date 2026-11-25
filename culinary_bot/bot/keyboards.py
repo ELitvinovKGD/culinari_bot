@@ -15,6 +15,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardBu
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from culinary_bot import texts
+from culinary_bot.bot import paging
 from culinary_bot.bot.callbacks import (
     AdmCb,
     AdminsCb,
@@ -29,6 +30,7 @@ from culinary_bot.bot.callbacks import (
     LeftCb,
     ListCb,
     MyOrderCb,
+    PickCb,
     ProfileCb,
     SetCb,
     SetupCb,
@@ -36,6 +38,27 @@ from culinary_bot.bot.callbacks import (
 )
 from culinary_bot.db.models import Admin, Dish, Issue, IssueItem, IssueStatus, Order, OrderStatus, Recipient
 from culinary_bot.services.money import format_price
+
+# ---------------------------------------------------------------------------
+# Общее: стрелки страниц
+# ---------------------------------------------------------------------------
+
+
+def nav_row(page: int, pages: int, make_cb) -> list[InlineKeyboardButton]:
+    """
+    Ряд «← 2/5 →» для длинных списков (bot/paging.py).
+
+    make_cb — функция «номер страницы → данные кнопки». Пустой список, если
+    страница одна: тогда стрелок нет совсем.
+    """
+    if pages <= 1:
+        return []
+    return [
+        InlineKeyboardButton(text="←", callback_data=make_cb(max(page - 1, 0)).pack()),
+        InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data=make_cb(page).pack()),
+        InlineKeyboardButton(text="→", callback_data=make_cb(min(page + 1, pages - 1)).pack()),
+    ]
+
 
 # ---------------------------------------------------------------------------
 # Клиент
@@ -75,6 +98,10 @@ def card(index: int, total: int, item: IssueItem, qty: int, cart_text: str, stoc
     if item.composition:
         kb.button(text="📋 Состав", callback_data=CardCb(action="comp", index=index, item_id=item.id))
         sizes.append(1)
+    if total >= paging.CAROUSEL_LIST_BUTTON_FROM:
+        # Блюд много — листать карточки долго, даём перейти к списку.
+        kb.button(text=f"📋 Весь список ({total})", callback_data=CheckoutCb(action="list"))
+        sizes.append(1)
     kb.button(text=cart_text, callback_data=CheckoutCb(action="list"))
     sizes.append(1)
     if stock_link:
@@ -97,30 +124,36 @@ def list_view(
     total_text: str,
     in_order: dict[int, int] | None = None,
     stock_link: bool = False,
+    page: int = 0,
 ) -> InlineKeyboardMarkup:
     """
     Полный список блюд: в каждой строке название с ценой и −/количество/+.
 
     in_order — сколько каждого блюда уже в оформленном заказе (при дозаказе):
     «01 Суп · 10 € · в заказе 2», а −/+ меняют только добавку.
+    Больше 12 блюд — страницами (bot/paging.py).
     """
     in_order = in_order or {}
+    shown, page, pages = paging.page_of(items, page, paging.CLIENT_LIST_PAGE)
     kb = InlineKeyboardBuilder()
-    for item in items:
+    for item in shown:
         # Название обрезаем, чтобы кнопка не была слишком длинной.
         name = item.name if len(item.name) <= 22 else item.name[:21] + "…"
         already = f" · в заказе {in_order[item.id]}" if in_order.get(item.id) else ""
         kb.row(
             InlineKeyboardButton(
                 text=f"{item.position:02d} {name} · {format_price(item.price_cents)}{already}",
-                callback_data=ListCb(action="card", item_id=item.id).pack(),
+                callback_data=ListCb(action="card", item_id=item.id, page=page).pack(),
             )
         )
         kb.row(
-            InlineKeyboardButton(text="−", callback_data=ListCb(action="minus", item_id=item.id).pack()),
+            InlineKeyboardButton(text="−", callback_data=ListCb(action="minus", item_id=item.id, page=page).pack()),
             InlineKeyboardButton(text=str(qty.get(item.id, 0)), callback_data=ListCb(action="noop").pack()),
-            InlineKeyboardButton(text="+", callback_data=ListCb(action="plus", item_id=item.id).pack()),
+            InlineKeyboardButton(text="+", callback_data=ListCb(action="plus", item_id=item.id, page=page).pack()),
         )
+    nav = nav_row(page, pages, lambda p: ListCb(action="page", page=p))
+    if nav:
+        kb.row(*nav)
     kb.row(InlineKeyboardButton(text=f"Дальше → {total_text}", callback_data=ListCb(action="next").pack()))
     if stock_link:
         kb.row(InlineKeyboardButton(text="🧺 Ещё вне лавки →", callback_data=StockCb(action="open").pack()))
@@ -299,21 +332,6 @@ def back(text: str, callback_data) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def catalog(dishes: list[Dish], archived: bool) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    if not archived:
-        kb.button(text="➕ Новое блюдо", callback_data=DishCb(action="new"))
-    for dish in dishes:
-        kb.button(text=f"{dish.emoji or '•'} {dish.name} · {format_price(dish.price_cents)}", callback_data=DishCb(action="view", dish_id=dish.id))
-    if archived:
-        kb.button(text="← Каталог", callback_data=AdmCb(section="catalog"))
-    else:
-        kb.button(text="🗄 Архив блюд", callback_data=AdmCb(section="archived"))
-        kb.button(text="← Админка", callback_data=AdmCb(section="home"))
-    kb.adjust(1)
-    return kb.as_markup()
-
-
 def dish(d: Dish) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for field, label in [
@@ -401,19 +419,6 @@ def issue(i: Issue) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def add_dish_choice(issue_id: int, dishes: list[Dish]) -> InlineKeyboardMarkup:
-    kb = InlineKeyboardBuilder()
-    kb.button(text="➕ Новое блюдо", callback_data=DishCb(action="new", issue_id=issue_id))
-    for d in dishes:
-        kb.button(
-            text=f"{d.emoji or '•'} {d.name} · {format_price(d.price_cents)}",
-            callback_data=IssueCb(action="add_dish", issue_id=issue_id, dish_id=d.id),
-        )
-    kb.button(text="← Выпуск", callback_data=IssueCb(action="view", issue_id=issue_id))
-    kb.adjust(1)
-    return kb.as_markup()
-
-
 def item(it: IssueItem, can_remove: bool) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for field, label in [
@@ -460,13 +465,32 @@ def confirm(text: str, cb, back_cb) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def orders_list(issue_id: int, orders: list[Order]) -> InlineKeyboardMarkup:
+def orders_list(issue_id: int, orders: list[Order], page: int = 0, show_all: bool = False) -> InlineKeyboardMarkup:
+    """
+    Заказы выпуска у шефа: по 15 на странице; по умолчанию только неотданные,
+    «Показать все» — с доставленными и отменёнными (решение от 26.11).
+    """
+    shown, page, pages = paging.page_of(orders, page, paging.ORDERS_PAGE)
     kb = InlineKeyboardBuilder()
-    for o in orders:
+    for o in shown:
         icon = texts.order_status_for_admin(o).split()[0]
-        kb.button(text=f"{icon} №{o.id} {o.name} · {format_price(o.total_cents)}", callback_data=AOrderCb(action="view", order_id=o.id))
-    kb.button(text="← Выпуск", callback_data=IssueCb(action="view", issue_id=issue_id))
-    kb.adjust(1)
+        kb.row(
+            InlineKeyboardButton(
+                text=f"{icon} №{o.id} {o.name} · {format_price(o.total_cents)}",
+                callback_data=AOrderCb(action="view", order_id=o.id).pack(),
+            )
+        )
+    flag = 1 if show_all else 0
+    nav = nav_row(page, pages, lambda p: IssueCb(action="orders", issue_id=issue_id, page=p, show_all=flag))
+    if nav:
+        kb.row(*nav)
+    toggle = "Только неотданные" if show_all else "Показать все"
+    kb.row(
+        InlineKeyboardButton(
+            text=toggle, callback_data=IssueCb(action="orders", issue_id=issue_id, show_all=1 - flag).pack()
+        )
+    )
+    kb.row(InlineKeyboardButton(text="← Выпуск", callback_data=IssueCb(action="view", issue_id=issue_id).pack()))
     return kb.as_markup()
 
 
@@ -500,15 +524,19 @@ def new_order_notification(order_id: int) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def leftovers(items: list[IssueItem], qty: dict[int, int]) -> InlineKeyboardMarkup:
+def leftovers(items: list[IssueItem], qty: dict[int, int], page: int = 0) -> InlineKeyboardMarkup:
+    shown, page, pages = paging.page_of(items, page, paging.LEFTOVERS_PAGE)
     kb = InlineKeyboardBuilder()
-    for it in items:
+    for it in shown:
         kb.row(InlineKeyboardButton(text=f"{it.position:02d} {it.name}", callback_data=LeftCb(action="noop").pack()))
         kb.row(
-            InlineKeyboardButton(text="−", callback_data=LeftCb(action="minus", item_id=it.id).pack()),
+            InlineKeyboardButton(text="−", callback_data=LeftCb(action="minus", item_id=it.id, page=page).pack()),
             InlineKeyboardButton(text=str(qty.get(it.id, 0)), callback_data=LeftCb(action="noop").pack()),
-            InlineKeyboardButton(text="+", callback_data=LeftCb(action="plus", item_id=it.id).pack()),
+            InlineKeyboardButton(text="+", callback_data=LeftCb(action="plus", item_id=it.id, page=page).pack()),
         )
+    nav = nav_row(page, pages, lambda p: LeftCb(action="page", page=p))
+    if nav:
+        kb.row(*nav)
     kb.row(InlineKeyboardButton(text="📣 Опубликовать в группе", callback_data=LeftCb(action="publish").pack()))
     kb.row(InlineKeyboardButton(text="Отмена", callback_data=LeftCb(action="cancel").pack()))
     return kb.as_markup()
@@ -590,31 +618,37 @@ def setup_start() -> InlineKeyboardMarkup:
 # ---------------------------------------------------------------------------
 
 
-def stock_list(items: list[IssueItem], qty: dict[int, int], total_text: str, lavka_link: bool = False) -> InlineKeyboardMarkup:
-    """Список блюд вне лавки: название · цена · остаток, и −/количество/+."""
+def stock_list(
+    items: list[IssueItem], qty: dict[int, int], total_text: str, lavka_link: bool = False, page: int = 0
+) -> InlineKeyboardMarkup:
+    """Список блюд вне лавки: название · цена · остаток, и −/количество/+ (страницами)."""
+    shown, page, pages = paging.page_of(items, page, paging.STOCK_PAGE)
     kb = InlineKeyboardBuilder()
-    for item in items:
+    for item in shown:
         name = item.name if len(item.name) <= 20 else item.name[:19] + "…"
         kb.row(
             InlineKeyboardButton(
                 text=f"{name} · {format_price(item.price_cents)} · ост. {item.stock_left}",
-                callback_data=StockCb(action="card", item_id=item.id).pack(),
+                callback_data=StockCb(action="card", item_id=item.id, page=page).pack(),
             )
         )
         kb.row(
-            InlineKeyboardButton(text="−", callback_data=StockCb(action="minus", item_id=item.id).pack()),
+            InlineKeyboardButton(text="−", callback_data=StockCb(action="minus", item_id=item.id, page=page).pack()),
             InlineKeyboardButton(text=str(qty.get(item.id, 0)), callback_data=StockCb(action="noop").pack()),
-            InlineKeyboardButton(text="+", callback_data=StockCb(action="plus", item_id=item.id).pack()),
+            InlineKeyboardButton(text="+", callback_data=StockCb(action="plus", item_id=item.id, page=page).pack()),
         )
+    nav = nav_row(page, pages, lambda p: StockCb(action="list", page=p))
+    if nav:
+        kb.row(*nav)
     kb.row(InlineKeyboardButton(text=f"🛒 Оформить → {total_text}", callback_data=StockCb(action="checkout").pack()))
     if lavka_link:
         kb.row(InlineKeyboardButton(text="🍽 Меню лавки →", callback_data=CardCb(action="show", index=0).pack()))
     return kb.as_markup()
 
 
-def stock_card_back() -> InlineKeyboardMarkup:
+def stock_card_back(page: int = 0) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="← К списку", callback_data=StockCb(action="list"))
+    kb.button(text="← К списку", callback_data=StockCb(action="list", page=page))
     return kb.as_markup()
 
 
@@ -672,12 +706,62 @@ def stock_admin(issue: Issue) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def stock_add_choice(issue_id: int, dishes: list[Dish]) -> InlineKeyboardMarkup:
-    """Выбор блюда из каталога для «вне лавки»."""
+def dish_picker(
+    mode: str,
+    dishes: list[Dish],
+    *,
+    issue_id: int = 0,
+    page: int = 0,
+    recent_ids: set[int] | None = None,
+    reasons: dict[int, str] | None = None,
+    found: bool = False,
+    total_in_catalog: int = 0,
+) -> InlineKeyboardMarkup:
+    """
+    Один и тот же список блюд для каталога, архива, добавления в лавку и «вне лавки».
+
+    mode: cat | arch | lavka | stock — от него зависит, что делает нажатие на блюдо
+    и какие кнопки внизу. Недавние помечены 🕘, найденные не по названию —
+    подсказкой «состав: …». Кнопка «🔍 Найти» — только если список длинный.
+    """
+    recent_ids = recent_ids or set()
+    reasons = reasons or {}
+    shown, page, pages = paging.page_of(dishes, page, paging.CATALOG_PAGE)
     kb = InlineKeyboardBuilder()
-    for d in dishes:
-        kb.button(text=f"{d.emoji or '•'} {d.name} · {format_price(d.price_cents)}", callback_data=IssueCb(action="stock_dish", issue_id=issue_id, dish_id=d.id))
-    kb.button(text="➕ Новое блюдо в каталог", callback_data=DishCb(action="new"))
-    kb.button(text="← Назад", callback_data=AdmCb(section="stock"))
-    kb.adjust(1)
+    for d in shown:
+        mark = "🕘" if d.id in recent_ids and not found else (d.emoji or "•")
+        text = f"{mark} {d.name} · {format_price(d.price_cents)}"
+        if d.id in reasons:
+            text += f" · {reasons[d.id]}"
+        if mode == "lavka":
+            cb = IssueCb(action="add_dish", issue_id=issue_id, dish_id=d.id)
+        elif mode == "stock":
+            cb = IssueCb(action="stock_dish", issue_id=issue_id, dish_id=d.id)
+        else:
+            cb = DishCb(action="view", dish_id=d.id)
+        kb.row(InlineKeyboardButton(text=text[:64], callback_data=cb.pack()))
+
+    found_flag = 1 if found else 0
+    nav = nav_row(page, pages, lambda p: PickCb(mode=mode, issue_id=issue_id, page=p, found=found_flag))
+    if nav:
+        kb.row(*nav)
+    if found:
+        kb.row(InlineKeyboardButton(text="✖ Сбросить поиск", callback_data=PickCb(mode=mode, action="reset", issue_id=issue_id).pack()))
+    elif total_in_catalog > paging.CATALOG_PAGE:
+        kb.row(InlineKeyboardButton(text="🔍 Найти", callback_data=PickCb(mode=mode, action="search", issue_id=issue_id).pack()))
+
+    if mode == "cat":
+        kb.row(InlineKeyboardButton(text="➕ Новое блюдо", callback_data=DishCb(action="new").pack()))
+        kb.row(
+            InlineKeyboardButton(text="🗄 Архив блюд", callback_data=PickCb(mode="arch").pack()),
+            InlineKeyboardButton(text="← Админка", callback_data=AdmCb(section="home").pack()),
+        )
+    elif mode == "arch":
+        kb.row(InlineKeyboardButton(text="← Каталог", callback_data=PickCb(mode="cat").pack()))
+    elif mode == "lavka":
+        kb.row(InlineKeyboardButton(text="➕ Новое блюдо", callback_data=DishCb(action="new", issue_id=issue_id).pack()))
+        kb.row(InlineKeyboardButton(text="← Выпуск", callback_data=IssueCb(action="view", issue_id=issue_id).pack()))
+    elif mode == "stock":
+        kb.row(InlineKeyboardButton(text="➕ Новое блюдо в каталог", callback_data=DishCb(action="new").pack()))
+        kb.row(InlineKeyboardButton(text="← Назад", callback_data=AdmCb(section="stock").pack()))
     return kb.as_markup()

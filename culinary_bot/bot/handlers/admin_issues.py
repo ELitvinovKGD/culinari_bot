@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from culinary_bot import texts
 from culinary_bot.bot import jobs, keyboards, publisher
 from culinary_bot.bot.callbacks import IssueCb, ItemCb, LeftCb
-from culinary_bot.bot.handlers import admin_stock, client_orders
+from culinary_bot.bot.handlers import admin_picker, admin_stock, client_orders
 from culinary_bot.bot.ui import replace_message
 from culinary_bot.db.models import DeliveryType, Issue, IssueItem, IssueKind, IssueStatus, OrderStatus, utcnow
 from culinary_bot.services import ServiceError
@@ -165,15 +165,11 @@ async def cb_view(callback: CallbackQuery, callback_data: IssueCb, state: FSMCon
 
 @router.callback_query(IssueCb.filter(F.action == "add"))
 async def cb_add(callback: CallbackQuery, callback_data: IssueCb, session: AsyncSession) -> None:
-    """Список блюд каталога, которых ещё нет в выпуске."""
+    """Выбор блюда для выпуска: недавние сверху, страницы, поиск (admin_picker.py)."""
     issue = await load_issue(callback, session, callback_data.issue_id)
     if not issue:
         return
-    used = {item.dish_id for item in issue.items}
-    dishes = [d for d in await catalog_service.list_dishes(session) if d.id not in used]
-    await callback.message.answer(
-        "Выберите блюдо из каталога или создайте новое:", reply_markup=keyboards.add_dish_choice(issue.id, dishes)
-    )
+    await admin_picker.send_picker(callback.message, session, "lavka", issue.id)
     await callback.answer()
 
 
@@ -397,12 +393,24 @@ async def cb_delete(callback: CallbackQuery, callback_data: IssueCb, session: As
 
 @router.callback_query(IssueCb.filter(F.action == "orders"))
 async def cb_orders(callback: CallbackQuery, callback_data: IssueCb, session: AsyncSession) -> None:
+    """
+    Заказы выпуска: по умолчанию только неотданные, «Показать все» — с остальными.
+    По 15 на странице (решение от 26.11).
+    """
     issue = await load_issue(callback, session, callback_data.issue_id)
     if not issue:
         return
     orders = await order_service.issue_orders(session, issue)
-    text = f"<b>Заказы — {texts.esc(issue.title)}</b>" if orders else "Заказов пока нет."
-    await callback.message.answer(text, reply_markup=keyboards.orders_list(issue.id, orders))
+    show_all = bool(callback_data.show_all)
+    shown = orders if show_all else [o for o in orders if o.status == OrderStatus.ACCEPTED]
+    title = f"<b>Заказы — {texts.esc(issue.title)}</b>\n"
+    title += f"Все: {len(shown)}" if show_all else f"Неотданные: {len(shown)} из {len(orders)}"
+    kb = keyboards.orders_list(issue.id, shown, callback_data.page, show_all)
+    # Первое открытие — новым сообщением; листание и переключатель — на месте.
+    if callback_data.page or callback.message.text and callback.message.text.startswith("Заказы"):
+        await replace_message(callback, title, kb)
+    else:
+        await callback.message.answer(title, reply_markup=kb)
     await callback.answer()
 
 
@@ -686,11 +694,13 @@ async def cb_leftovers_edit(callback: CallbackQuery, callback_data: LeftCb, stat
     qty: dict[str, int] = data["qty"]
     action = callback_data.action
 
-    if action in ("plus", "minus"):
-        key = str(callback_data.item_id)
-        qty[key] = max(0, qty.get(key, 0) + (1 if action == "plus" else -1))
-        await state.update_data(qty=qty)
-        await callback.message.edit_reply_markup(reply_markup=keyboards.leftovers(issue.items, {int(k): v for k, v in qty.items()}))
+    if action in ("plus", "minus", "page"):
+        if action != "page":
+            key = str(callback_data.item_id)
+            qty[key] = max(0, qty.get(key, 0) + (1 if action == "plus" else -1))
+            await state.update_data(qty=qty)
+        kb = keyboards.leftovers(issue.items, {int(k): v for k, v in qty.items()}, callback_data.page)
+        await callback.message.edit_reply_markup(reply_markup=kb)
     elif action == "cancel":
         await state.clear()
         await replace_message(callback, "Отменено.")

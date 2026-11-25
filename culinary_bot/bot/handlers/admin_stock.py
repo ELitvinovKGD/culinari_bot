@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from culinary_bot import texts
 from culinary_bot.bot import keyboards, publisher
 from culinary_bot.bot.callbacks import IssueCb, ItemCb
+from culinary_bot.bot.handlers import admin_picker
 from culinary_bot.db.models import Issue, OrderStatus
 from culinary_bot.services import ServiceError
 from culinary_bot.services import catalog as catalog_service
@@ -53,11 +54,8 @@ async def send_stock(message: Message, session: AsyncSession, issue: Issue | Non
 
 @router.callback_query(IssueCb.filter(F.action == "stock_add"))
 async def cb_add(callback: CallbackQuery, callback_data: IssueCb, session: AsyncSession) -> None:
-    dishes = await catalog_service.list_dishes(session)
-    await callback.message.answer(
-        "Какое блюдо выставить «в наличие»? (Если уже было — остаток пополнится.)",
-        reply_markup=keyboards.stock_add_choice(callback_data.issue_id, dishes),
-    )
+    """Выбор блюда: недавние сверху, страницы, поиск (admin_picker.py)."""
+    await admin_picker.send_picker(callback.message, session, "stock", callback_data.issue_id)
     await callback.answer()
 
 

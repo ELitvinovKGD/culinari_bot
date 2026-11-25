@@ -83,14 +83,14 @@ async def card_view(session: AsyncSession, customer: Customer, issue: Issue, ind
     return text, keyboards.card(index, len(items), item, qty, cart_text, stock_link), item.photo_file_id
 
 
-async def list_view(session: AsyncSession, customer: Customer, issue: Issue):
+async def list_view(session: AsyncSession, customer: Customer, issue: Issue, page: int = 0):
     """Собрать экран «полный список»: (текст, клавиатура)."""
     items = issue_service.active_items(issue)
     cart = await cart_service.get_cart(session, customer, issue)
     total = cart_service.cart_total_cents(cart)
     existing = await existing_order(session, customer, issue)
     in_order = existing.menu_quantities if existing else None
-    kb = keyboards.list_view(items, cart_service.quantities(cart), format_price(total), in_order, await has_stock(session))
+    kb = keyboards.list_view(items, cart_service.quantities(cart), format_price(total), in_order, await has_stock(session), page)
     return texts.list_view_text(issue), kb
 
 
@@ -201,22 +201,23 @@ async def cb_open_list(callback: CallbackQuery, session: AsyncSession, customer:
     await callback.answer()
 
 
-@router.callback_query(ListCb.filter(F.action.in_({"plus", "minus"})))
+@router.callback_query(ListCb.filter(F.action.in_({"plus", "minus", "page"})))
 async def cb_list_qty(callback: CallbackQuery, callback_data: ListCb, session: AsyncSession, customer: Customer) -> None:
-    """+/− в полном списке."""
+    """+/− в полном списке и переход по страницам (страница сохраняется)."""
     issue = await get_issue_for_callback(callback, session)
     if issue is None:
         return
-    item = await session.get(IssueItem, callback_data.item_id)
-    if item is None or item.issue_id != issue.id:
-        await callback.answer(texts.SOMETHING_WRONG, show_alert=True)
-        return
-    try:
-        await cart_service.change_quantity(session, customer, item, +1 if callback_data.action == "plus" else -1)
-    except ServiceError as error:
-        await callback.answer(str(error), show_alert=True)
-        return
-    text, kb = await list_view(session, customer, issue)
+    if callback_data.action != "page":
+        item = await session.get(IssueItem, callback_data.item_id)
+        if item is None or item.issue_id != issue.id:
+            await callback.answer(texts.SOMETHING_WRONG, show_alert=True)
+            return
+        try:
+            await cart_service.change_quantity(session, customer, item, +1 if callback_data.action == "plus" else -1)
+        except ServiceError as error:
+            await callback.answer(str(error), show_alert=True)
+            return
+    text, kb = await list_view(session, customer, issue, callback_data.page)
     await replace_message(callback, text, kb)
     await callback.answer()
 

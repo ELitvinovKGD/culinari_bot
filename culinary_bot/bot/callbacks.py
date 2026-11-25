@@ -37,10 +37,14 @@ class CardCb(CallbackData, prefix="card"):
 
 
 class ListCb(CallbackData, prefix="lst"):
-    """Полный список блюд: plus, minus, card (открыть карточку), next (к «Итого»), noop."""
+    """
+    Полный список блюд: plus, minus, card (открыть карточку), next (к «Итого»),
+    page (другая страница), noop. page — на какой странице список (см. bot/paging.py).
+    """
 
     action: str
     item_id: int = 0
+    page: int = 0
 
 
 class CheckoutCb(CallbackData, prefix="chk"):
@@ -106,6 +110,8 @@ class IssueCb(CallbackData, prefix="iss"):
     issue_id: int = 0
     dish_id: int = 0
     order_id: int = 0
+    page: int = 0  # страница списка заказов
+    show_all: int = 0  # 1 — заказы со всеми статусами, 0 — только неотданные
 
 
 class ItemCb(CallbackData, prefix="itm"):
@@ -162,10 +168,11 @@ class AdminsCb(CallbackData, prefix="adms"):
 
 
 class LeftCb(CallbackData, prefix="left"):
-    """Лишние порции: plus, minus, publish, cancel, noop."""
+    """Лишние порции: plus, minus, publish, cancel, page, noop."""
 
     action: str
     item_id: int = 0
+    page: int = 0
 
 
 class SetupCb(CallbackData, prefix="setup"):
@@ -196,3 +203,20 @@ class StockCb(CallbackData, prefix="stk"):
     action: str
     item_id: int = 0
     order_id: int = 0
+    page: int = 0
+
+
+class PickCb(CallbackData, prefix="pick"):
+    """
+    Выбор блюда из каталога со страницами и поиском (решение от 26.11).
+
+    mode — где выбираем: cat (каталог), arch (архив), lavka (в выпуск issue_id),
+    stock (вне лавки issue_id). action: page (страница page), search (начать
+    поиск), reset (сбросить поиск). found=1 — листаем результаты поиска.
+    """
+
+    mode: str
+    action: str = "page"
+    issue_id: int = 0
+    page: int = 0
+    found: int = 0

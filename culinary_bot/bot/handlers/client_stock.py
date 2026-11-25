@@ -47,7 +47,7 @@ async def visible_items(session: AsyncSession, customer: Customer, stock: Issue)
     return items, qty, cart_service.cart_total_cents(cart)
 
 
-async def stock_screen(session: AsyncSession, customer: Customer):
+async def stock_screen(session: AsyncSession, customer: Customer, page: int = 0):
     """(текст, клавиатура) экрана «🧺 Вне лавки» или None, если всё разобрали."""
     stock = await issue_service.find_stock_issue(session)
     if stock is None:
@@ -59,7 +59,7 @@ async def stock_screen(session: AsyncSession, customer: Customer):
     lavka_title = attachable[-1].issue.title if attachable else None
     lavka_open = await issue_service.get_open_issue(session) is not None
     text = texts.stock_view_text(stock, settings.stock_hold_minutes, lavka_title)
-    return text, keyboards.stock_list(items, qty, format_price(total), lavka_link=lavka_open)
+    return text, keyboards.stock_list(items, qty, format_price(total), lavka_link=lavka_open, page=page)
 
 
 async def show_stock(message: Message, session: AsyncSession, customer: Customer) -> None:
@@ -102,7 +102,7 @@ async def cb_qty(callback: CallbackQuery, callback_data: StockCb, session: Async
         except ServiceError as error:
             await callback.answer(str(error), show_alert=True)
             return
-    screen = await stock_screen(session, customer)
+    screen = await stock_screen(session, customer, callback_data.page)
     if screen is None:
         await replace_message(callback, texts.STOCK_EMPTY)
     else:
@@ -116,7 +116,7 @@ async def cb_card(callback: CallbackQuery, callback_data: StockCb, session: Asyn
     if item is None or not item.is_stock:
         await callback.answer(texts.SOMETHING_WRONG, show_alert=True)
         return
-    await replace_message(callback, texts.stock_item_card(item), keyboards.stock_card_back(), item.photo_file_id)
+    await replace_message(callback, texts.stock_item_card(item), keyboards.stock_card_back(callback_data.page), item.photo_file_id)
     await callback.answer()
 
 

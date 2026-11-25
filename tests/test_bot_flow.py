@@ -60,6 +60,13 @@ class FakeSession(BaseSession):
 
     async def make_request(self, bot, method, timeout=None):
         self.calls.append(method)
+        # Как настоящий Telegram: больше 100 кнопок под сообщением — ошибка
+        # («reply markup is too long»). Ловит списки без страниц.
+        markup = getattr(method, "reply_markup", None)
+        if markup is not None and hasattr(markup, "inline_keyboard"):
+            buttons = sum(len(row) for row in markup.inline_keyboard)
+            if buttons > 100:
+                raise TelegramBadRequest(method=method, message=f"Bad Request: reply markup is too long ({buttons})")
         # Ведём себя как настоящий Telegram: edit_text у фото — ошибка.
         if isinstance(method, EditMessageText) and method.message_id in self.photo_message_ids:
             raise TelegramBadRequest(method=method, message="Bad Request: there is no text in the message to edit")
@@ -792,3 +799,74 @@ async def test_stock_gift_goes_with_lavka(harness):
         gift = (await s.scalars(select(Order).order_by(Order.id.desc()))).first()
         assert gift.issue_id == lavka_id and gift.recipient_id is not None
         assert gift.issue.kind == IssueKind.LAVKA
+
+
+
+async def test_long_lists(harness):
+    """
+    Длинные списки (решение от 26.11): 30 блюд в лавке, 40 в каталоге, 40 заказов —
+    ни один экран не превышает лимит Telegram в 100 кнопок; есть страницы,
+    «📋 Весь список», недавние, поиск по составу и фильтр заказов.
+    """
+    from culinary_bot.bot.callbacks import AdmCb, PickCb
+    from culinary_bot.db.models import DeliveryType
+    from culinary_bot.services import cart as cart_service
+    from culinary_bot.services import catalog as catalog_service
+    from culinary_bot.services import customers as customer_service
+    from culinary_bot.services import issues as issue_service
+    from culinary_bot.services import orders as order_service
+
+    h = harness
+    async with h.maker() as s:
+        dishes = []
+        for i in range(40):
+            composition = "курица, орехи, специи" if i == 7 else None
+            dishes.append(await catalog_service.create_dish(s, name=f"Блюдо {i:02d}", price_cents=1000, composition=composition))
+        lavka = await issue_service.create_draft(s, "Большая лавка")
+        for d in dishes[:30]:
+            await issue_service.add_dish_to_issue(s, lavka, d)
+        await issue_service.open_issue(s, lavka)
+        for n in range(40):
+            c = await customer_service.get_or_create(s, 1000 + n, None)
+            customer_service.save_contact(c, name=f"К{n}", phone="555123456", delivery_type=DeliveryType.PICKUP, address=None)
+            await cart_service.change_quantity(s, c, lavka.items[0], +1)
+            o = await order_service.place_order(s, c, lavka, comment=None)
+            if n < 10:
+                order_service.mark_delivered(o)
+        await s.commit()
+        lavka_id = lavka.id
+
+    # Клиент: карусель с «📋 Весь список», список страницами.
+    await h.send(CLIENT, "🍽 Меню лавки")
+    labels = [b.text for row in h.fake.calls[-1].reply_markup.inline_keyboard for b in row]
+    assert "📋 Весь список (30)" in labels
+    await h.click(CLIENT, CheckoutCb(action="list"))
+    labels = [b.text for row in h.fake.calls[-2].reply_markup.inline_keyboard for b in row]
+    assert "1/3" in labels
+    await h.click(CLIENT, ListCb(action="page", page=2))
+    await h.click(CLIENT, ListCb(action="plus", item_id=30, page=2))
+
+    # Шеф: каталог страницами, недавние, поиск по составу.
+    await h.click(OWNER, AdmCb(section="catalog"))
+    catalog_call = [c for c in h.fake.calls if "Каталог блюд" in (getattr(c, "text", "") or "")][-1]
+    labels = [b.text for row in catalog_call.reply_markup.inline_keyboard for b in row]
+    assert any(t.startswith("🕘") for t in labels) and "🔍 Найти" in labels
+    await h.click(OWNER, PickCb(mode="cat", action="search"))
+    await h.send(OWNER, "Курица")
+    result = h.fake.calls[-1]
+    labels = [b.text for row in result.reply_markup.inline_keyboard for b in row]
+    assert any("Блюдо 07" in t and "состав" in t for t in labels)
+    await h.click(OWNER, PickCb(mode="lavka", issue_id=lavka_id, page=1))
+
+    # Заказы: по умолчанию неотданные (30), страницами; «Показать все» — 40.
+    await h.click(OWNER, IssueCb(action="orders", issue_id=lavka_id))
+    assert "Неотданные: 30 из 40" in h.fake.texts()[-1]
+    await h.click(OWNER, IssueCb(action="orders", issue_id=lavka_id, page=1))
+    await h.click(OWNER, IssueCb(action="orders", issue_id=lavka_id, show_all=1))
+    assert "Все: 40" in h.fake.texts()[-1]
+
+    # Лишние порции при 30 блюдах — страницами.
+    await h.click(OWNER, IssueCb(action="leftovers", issue_id=lavka_id))
+    from culinary_bot.bot.callbacks import LeftCb
+
+    await h.click(OWNER, LeftCb(action="page", page=2))

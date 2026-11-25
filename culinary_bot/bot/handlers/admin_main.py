@@ -14,13 +14,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from culinary_bot import texts
 from culinary_bot.bot import keyboards
 from culinary_bot.bot.callbacks import AdmCb, AdminsCb, SetCb
-from culinary_bot.bot.handlers import admin_setup, admin_stock
+from culinary_bot.bot.handlers import admin_picker, admin_setup, admin_stock
 from culinary_bot.bot.publisher import deep_link
 from culinary_bot.bot.ui import replace_message
 from culinary_bot.db.models import Admin
 from culinary_bot.services import ServiceError
 from culinary_bot.services import admins as admin_service
-from culinary_bot.services import catalog as catalog_service
 from culinary_bot.services import issues as issue_service
 from culinary_bot.services import settings as settings_service
 
@@ -84,12 +83,10 @@ async def cb_section(
     elif section == "archive":
         issues = await issue_service.list_finished_issues(session)
         await replace_message(callback, "<b>Архив выпусков</b>", reply_markup=keyboards.issues_list(issues, archive=True))
-    elif section == "catalog":
-        dishes = await catalog_service.list_dishes(session)
-        await replace_message(callback, "<b>Каталог блюд</b>", reply_markup=keyboards.catalog(dishes, archived=False))
-    elif section == "archived":
-        dishes = await catalog_service.list_dishes(session, archived=True)
-        await replace_message(callback, "<b>Архив блюд</b>", reply_markup=keyboards.catalog(dishes, archived=True))
+    elif section in ("catalog", "archived"):
+        mode = "cat" if section == "catalog" else "arch"
+        text, kb = await admin_picker.picker_screen(session, mode)
+        await replace_message(callback, text, reply_markup=kb)
     elif section == "stock":
         await admin_stock.send_stock(callback.message, session)
     elif section == "settings":
