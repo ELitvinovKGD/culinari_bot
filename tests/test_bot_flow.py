@@ -600,9 +600,13 @@ async def test_gift_order(harness):
     await h.click(CLIENT, CardCb(action="plus", index=0, item_id=1))
     await h.click(CLIENT, CheckoutCb(action="list"))
     await h.click(CLIENT, ListCb(action="next"))
-    summary_call = [c for c in h.fake.calls if getattr(c, "reply_markup", None) and "Уже заказано" in (getattr(c, "text", "") or "")][-1]
-    labels = [b.text for row in summary_call.reply_markup.inline_keyboard for b in row]
-    assert any("заказу: Маша" in t for t in labels) and any("моему" in t for t in labels)
+    # Заказов два (себе и Маше) — сначала только «Куда добавить?», без «Уже заказано».
+    where_call = [c for c in h.fake.calls if "Куда добавить" in (getattr(c, "text", "") or "")][-1]
+    assert "Уже заказано" not in where_call.text
+    labels = [b.text for row in where_call.reply_markup.inline_keyboard for b in row]
+    assert any("получателю: Маша" in t for t in labels) and any("К моему заказу" in t for t in labels)
+    await h.click(CLIENT, CheckoutCb(action="pick_to", rid=rec.id))
+    assert "Уже заказано" in h.fake.texts()[-1] and "Маша" in h.fake.texts()[-1]
     await h.click(CLIENT, CheckoutCb(action="add_to", rid=rec.id))
     await h.click(CLIENT, CheckoutCb(action="skip"))
     await h.time_passes()
@@ -626,3 +630,98 @@ async def test_gift_order(harness):
     assert len(to_eva) == 1
     assert "Ваш заказ" in to_eva[0] and "Заказ получателю: Маша" in to_eva[0] and "Оплачивает получатель" in to_eva[0]
     assert "К оплате вами: 10 €" in to_eva[0]
+
+
+async def test_stock_flow(harness):
+    """
+    «🧺 Блюда вне лавки»: шеф выставляет капусту (2 банки), клиент бронирует,
+    оформляет отдельно; второй клиент добавляет к заказу в лавке; шеф сообщает
+    всем и отмечает «все отданы».
+    """
+    from culinary_bot.bot.callbacks import AdmCb, StockCb
+    from culinary_bot.db.models import IssueItem, IssueKind
+
+    h = harness
+    await h.click(OWNER, DishCb(action="new"))
+    await h.send(OWNER, "Капуста")
+    for _ in range(4):
+        await h.click(OWNER, DishCb(action="skip"))
+    await h.send(OWNER, "6")
+    await h.click(OWNER, DishCb(action="skip"))
+    await h.send(OWNER, "/connect", chat_id=GROUP)
+
+    # Пусто — «всё разобрали».
+    await h.send(CLIENT, "🧺 В наличии")
+    assert "всё разобрали" in h.fake.texts()[-1]
+
+    await h.click(OWNER, AdmCb(section="stock"))
+    async with h.maker() as s:
+        stock = await s.scalar(select(Issue).where(Issue.kind == IssueKind.STOCK))
+    await h.click(OWNER, IssueCb(action="stock_add", issue_id=stock.id))
+    await h.click(OWNER, IssueCb(action="stock_dish", issue_id=stock.id, dish_id=1))
+    await h.send(OWNER, "2")
+    await h.click(OWNER, IssueCb(action="stock_post", issue_id=stock.id))
+    assert any("Осталось: 2" in t for t in h.fake.texts())
+    async with h.maker() as s:
+        item = await s.scalar(select(IssueItem).where(IssueItem.issue_id == stock.id))
+
+    # Клиент: 2 банки, третья не даётся.
+    await h.send(CLIENT, "/start stock")
+    await h.click(CLIENT, StockCb(action="plus", item_id=item.id))
+    await h.click(CLIENT, StockCb(action="plus", item_id=item.id))
+    await h.click(3, StockCb(action="plus", item_id=item.id))
+    assert any("всё разобрали" in (getattr(c, "text", "") or "") for c in h.fake.calls[-3:])
+    await h.click(CLIENT, StockCb(action="minus", item_id=item.id))  # одну вернул
+
+    # Отдельный заказ (лавки нет): данные → комментарий.
+    await h.click(CLIENT, StockCb(action="checkout"))
+    await h.click(CLIENT, CheckoutCb(action="privacy"))
+    await h.send(CLIENT, "Ева")
+    await h.send(CLIENT, "557692377")
+    await h.click(CLIENT, CheckoutCb(action="pickup"))
+    await h.click(CLIENT, CheckoutCb(action="skip"))
+    assert "Шеф напишет, когда будет готово" in h.fake.texts()[-1]
+    async with h.maker() as s:
+        order = await s.scalar(select(Order).where(Order.issue_id == stock.id))
+        assert order.total_cents == 600
+        assert (await s.get(IssueItem, item.id)).stock_left == 1
+
+    # Второй клиент: лавка с его заказом → «Куда добавить?» → к заказу в лавке.
+    await h.click(OWNER, IssueCb(action="new"))
+    await h.send(OWNER, "Лавка")
+    async with h.maker() as s:
+        lavka = await s.scalar(select(Issue).where(Issue.kind == IssueKind.LAVKA))
+    await h.click(OWNER, IssueCb(action="view", issue_id=lavka.id))
+    await h.click(OWNER, IssueCb(action="add_dish", issue_id=lavka.id, dish_id=1))
+    await h.click(OWNER, IssueCb(action="publish_yes", issue_id=lavka.id))
+    async with h.maker() as s:
+        lavka_item = (await s.get(Issue, lavka.id)).items[0]
+    await h.click(3, CardCb(action="plus", index=0, item_id=lavka_item.id))
+    await h.click(3, CheckoutCb(action="list"))
+    await h.click(3, ListCb(action="next"))
+    await h.click(3, CheckoutCb(action="confirm"))
+    await h.click(3, CheckoutCb(action="privacy"))
+    await h.send(3, "Иван")
+    await h.send(3, "555123456")
+    await h.click(3, CheckoutCb(action="pickup"))
+    await h.click(3, CheckoutCb(action="skip"))
+    await h.click(3, StockCb(action="plus", item_id=item.id))
+    await h.click(3, StockCb(action="checkout"))
+    assert "Добавить к нему" in h.fake.texts()[-1]
+    async with h.maker() as s:
+        ivan_order = await s.scalar(select(Order).where(Order.issue_id == lavka.id))
+    await h.click(3, StockCb(action="to", order_id=ivan_order.id))
+    await h.click(3, CheckoutCb(action="skip"))
+    assert "Добавлено к заказу" in h.fake.texts()[-1]
+    async with h.maker() as s:
+        parts = list(await s.scalars(select(Order).where(Order.issue_id == lavka.id)))
+        assert len(parts) == 2 and (await s.get(IssueItem, item.id)).stock_left == 0
+
+    # Шеф: сообщить всем с заказами вне лавки и отметить отданными.
+    await h.click(OWNER, IssueCb(action="stock_notify", issue_id=stock.id))
+    await h.send(OWNER, "Капуста готова, завтра развожу")
+    assert any("Капуста готова" in t and "К оплате: 6 €" in t for t in h.fake.texts())
+    await h.click(OWNER, IssueCb(action="excel", issue_id=stock.id))
+    await h.click(OWNER, IssueCb(action="stock_done_yes", issue_id=stock.id))
+    async with h.maker() as s:
+        assert (await s.get(Order, order.id)).status == OrderStatus.DELIVERED

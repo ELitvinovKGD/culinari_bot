@@ -14,6 +14,7 @@ from culinary_bot.db.models import (
     DeliveryType,
     Issue,
     IssueItem,
+    IssueKind,
     IssueStatus,
     Order,
     OrderItem,
@@ -109,6 +110,85 @@ async def place_order(
     return order
 
 
+async def place_stock_order(
+    session: AsyncSession, customer: Customer, stock: Issue, comment: str | None, base: Order | None = None
+) -> Order:
+    """
+    Оформить заказ «🧺 В наличии» из корзины блюд вне лавки (решение от 26.11).
+
+    base — заказ в лавке, к которому добавить (лавка открыта или ещё не
+    развезена): тогда новая часть записывается в ТУ лавку — шеф увидит её
+    в таблице лавки строками «🧺» и отвезёт вместе. Без base — отдельный
+    заказ в выпуске «Блюда вне лавки»: шеф отдаст, когда будет готов.
+    Бронь в корзине уже держит остаток — здесь он не меняется.
+    """
+    cart = await cart_service.get_cart(session, customer, stock)
+    if not cart:
+        raise ServiceError("Корзина пуста — добавьте хотя бы одно блюдо.")
+    if base is not None:
+        if base.customer_id != customer.id or base.status != OrderStatus.ACCEPTED:
+            raise ServiceError("К этому заказу уже нельзя добавить.")
+        if base.issue.status not in (IssueStatus.OPEN, IssueStatus.CLOSED):
+            raise ServiceError("Эта лавка уже развезена — оформите отдельный заказ.")
+        source, issue_id = base, base.issue_id
+    else:
+        if not customer.has_saved_data():
+            raise ServiceError("Не заполнены контактные данные.")
+        source, issue_id = customer, stock.id
+    order = Order(
+        issue_id=issue_id,
+        customer_id=customer.id,
+        status=OrderStatus.ACCEPTED,
+        name=source.name,
+        phone=source.phone,
+        username=customer.username,
+        delivery_type=source.delivery_type,
+        address=source.address,
+        latitude=source.latitude,
+        longitude=source.longitude,
+        recipient_id=base.recipient_id if base else None,
+        payer=base.payer if base else None,
+        comment=(comment or "").strip() or None,
+        items=[
+            OrderItem(
+                issue_item_id=ci.issue_item.id,
+                name=ci.issue_item.name,
+                portion=ci.issue_item.portion,
+                price_cents=ci.issue_item.price_cents,
+                quantity=ci.quantity,
+            )
+            for ci in cart
+        ],
+    )
+    session.add(order)
+    await cart_service.clear_cart(session, customer, stock)
+    await session.flush()
+    return order
+
+
+async def attachable_orders(session: AsyncSession, customer: Customer) -> list[Order]:
+    """
+    Заказы клиента в лавках, к которым можно добавить блюда вне лавки:
+    лавка открыта или закрыта (ещё не развезена), заказ принят.
+    По одному (последнему) на пару «лавка + получатель».
+    """
+    result = await session.scalars(
+        select(Order)
+        .join(Issue, Issue.id == Order.issue_id)
+        .where(
+            Order.customer_id == customer.id,
+            Order.status == OrderStatus.ACCEPTED,
+            Issue.kind == IssueKind.LAVKA,
+            Issue.status.in_([IssueStatus.OPEN, IssueStatus.CLOSED]),
+        )
+        .order_by(Order.id)
+    )
+    latest: dict[tuple[int, int | None], Order] = {}
+    for order in result:
+        latest[(order.issue_id, order.recipient_id)] = order
+    return list(latest.values())
+
+
 async def get_order(session: AsyncSession, order_id: int) -> Order:
     """Заказ по номеру или ServiceError."""
     order = await session.get(Order, order_id)
@@ -129,6 +209,13 @@ async def cancel_order(session: AsyncSession, order: Order, *, by: str) -> None:
     order.status = OrderStatus.CANCELLED
     order.cancelled_at = utcnow()
     order.cancelled_by = by
+    # Блюда вне лавки возвращаются в остаток — их снова можно заказать.
+    for item in order.items:
+        if item.issue_item_id is None:
+            continue
+        issue_item = await session.get(IssueItem, item.issue_item_id)
+        if issue_item is not None and issue_item.is_stock:
+            await cart_service.reserve(session, issue_item, -item.quantity)
 
 
 # ---------------------------------------------------------------------------

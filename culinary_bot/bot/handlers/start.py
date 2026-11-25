@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from culinary_bot import texts
 from culinary_bot.bot import keyboards
 from culinary_bot.bot.callbacks import DeleteMeCb
-from culinary_bot.bot.handlers import client_menu
+from culinary_bot.bot.handlers import client_menu, client_stock
 from culinary_bot.bot.publisher import notify_admins
 from culinary_bot.bot.ui import replace_message
 from culinary_bot.db.models import Customer
@@ -62,6 +62,9 @@ async def cmd_start(
     await message.answer(texts.WELCOME, reply_markup=keyboards.main_menu(is_admin))
     if payload == "menu":
         await client_menu.show_menu(message, session, customer)
+    elif payload == "stock":
+        # Кнопка «Заказать» под постом блюд вне лавки.
+        await client_stock.show_stock(message, session, customer)
 
 
 @router.message(F.text == texts.BTN_MENU)

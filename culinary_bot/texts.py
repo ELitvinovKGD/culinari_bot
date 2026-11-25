@@ -66,6 +66,8 @@ BTN_MY_ORDERS = "🧾 Мои заказы"
 BTN_ADMIN = "⚙️ Админка"
 BTN_WRITE_CHEF = "✉️ Написать шефу"
 BTN_MY_DATA = "👤 Мои данные"
+BTN_STOCK = "🧺 В наличии"
+STOCK_EMPTY = "У шефа всё разобрали. Загляните позже 🙂"
 NO_CHEF_CONTACT = "Шеф пока не указал контакт. Напишите ему в группе."
 
 WELCOME = "Привет! Здесь можно заказать блюда из «Тайной лавки шефа».\nНажмите «🍽 Меню», чтобы посмотреть текущий выпуск."
@@ -159,7 +161,14 @@ def menu_post_text(issue: Issue, order_link: str | None = None) -> str:
     if issue.header:
         parts.append(esc(issue.header))
     parts.append(f"<b>{esc(issue.title)}</b>")
-    parts.extend(item_block(item) for item in issue.items if item.is_active)
+    for item in issue.items:
+        if not item.is_active:
+            continue
+        if item.is_stock:
+            if item.stock_left and item.stock_left > 0:
+                parts.append(f"{item_block(item)}\nОсталось: {item.stock_left}")
+        else:
+            parts.append(item_block(item))
     if issue.footer:
         parts.append(esc(issue.footer))
     if order_link:
@@ -230,6 +239,11 @@ def summary_text(cart: list[CartItem], total_cents: int, existing: CustomerSumma
         f"<b>В итоге:</b> {together}\n"
         f"<b>К оплате: {format_price(existing.total_cents + total_cents)}</b>"
     )
+
+
+def where_to_add_text(cart: list[CartItem], total_cents: int) -> str:
+    """Несколько заказов (себе и получателям): сначала только «Куда добавить?» (решение от 26.11)."""
+    return f"<b>Добавляете:</b>\n{cart_lines(cart)}\n\nНа сумму {format_price(total_cents)}.\n\n<b>Куда добавить?</b>"
 
 
 def summary_lines(summary: CustomerSummary) -> str:
@@ -538,3 +552,53 @@ def extra_added(order: Order, name: str, qty: int, price_cents: int) -> str:
 
 def cancelled_by_admin(order: Order) -> str:
     return f"Шеф отменил ваш {order_label(order)}. Если это неожиданно — напишите ему."
+
+
+
+# ---------------------------------------------------------------------------
+# «🧺 Блюда вне лавки»
+# ---------------------------------------------------------------------------
+
+
+def stock_view_text(issue: Issue, hold_minutes: int) -> str:
+    """Шапка экрана «🧺 В наличии» у клиента."""
+    header = f"{esc(issue.header)}\n\n" if issue.header else ""
+    return (
+        f"🧺 <b>В наличии у шефа</b>\n\n{header}"
+        f"Выберите количество. Корзина бронирует порции на {hold_minutes} мин.\n"
+        "Название — открыть карточку с фото."
+    )
+
+
+def stock_item_card(item: IssueItem) -> str:
+    """Карточка блюда вне лавки: как в лавке + остаток и состав."""
+    composition = f"\n\n<i>Состав: {esc(item.composition)}</i>" if item.composition else ""
+    return f"{item_block(item)}\nОсталось: {item.stock_left}{composition}"
+
+
+def stock_where_text() -> str:
+    return (
+        "У вас есть заказ в лавке. Добавить к нему — тогда шеф привезёт всё вместе?\n"
+        "Или оформить отдельно — шеф отдаст, когда будет готов."
+    )
+
+
+def stock_offer(items: list[IssueItem]) -> str:
+    """Предложение после заказа из лавки: «Ещё у шефа в наличии: …»."""
+    names = ", ".join(esc(item.name) for item in items[:5])
+    more = " и другое" if len(items) > 5 else ""
+    return f"🧺 Ещё у шефа в наличии: {names}{more}."
+
+
+def stock_for_admin(issue: Issue, pending: int) -> str:
+    """Экран «🧺 Блюда вне лавки» в админке."""
+    lines = [f"🧺 <b>{esc(issue.title)}</b>", ""]
+    lines.append(f"<b>Шапка поста:</b> {esc(shorten(issue.header)) if issue.header else '— не заполнена'}")
+    lines.append("")
+    if not issue.items:
+        lines.append("Блюд пока нет — нажмите «➕ Блюдо» и укажите, сколько есть.")
+    for item in issue.items:
+        off = "" if item.is_active else " ⛔ снято"
+        lines.append(f"{esc(item.name)} — {format_price(item.price_cents)} · осталось {item.stock_left}{off}")
+    lines += ["", f"Неотданных заказов: {pending}"]
+    return "\n".join(lines)

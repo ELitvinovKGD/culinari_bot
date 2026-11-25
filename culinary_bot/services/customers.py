@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from culinary_bot.db.models import CartItem, Customer, DeliveryType
 from culinary_bot.services import ServiceError
+from culinary_bot.services.cart import return_stock
 
 
 async def get_or_create(session: AsyncSession, tg_id: int, username: str | None) -> Customer:
@@ -90,4 +91,4 @@ async def delete_personal_data(session: AsyncSession, customer: Customer) -> Non
     customer.privacy_accepted = False
     carts = await session.scalars(select(CartItem).where(CartItem.customer_id == customer.id))
     for item in carts:
-        await session.delete(item)
+        await return_stock(session, item)  # бронь блюд вне лавки возвращается в остаток

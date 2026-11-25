@@ -1,7 +1,11 @@
 """
 Фоновые задачи: то, что бот делает сам, без нажатия кнопки.
 
-Сейчас задача одна — «подтверждение» заказов после окна правки.
+Задачи две:
+1. «Подтверждение» заказов после окна правки (ниже).
+2. Снятие брони «🧺 В наличии»: если корзину с блюдами вне лавки не трогали
+   дольше часа (STOCK_HOLD_MINUTES), порции возвращаются в остаток.
+
 Клиент оформил заказ → 10 минут может нажать «✏️ Изменить» → потом заказ
 «сформирован»: пост в группу и уведомление шефу.
 
@@ -20,7 +24,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from culinary_bot import texts
 from culinary_bot.bot import keyboards, publisher
+from culinary_bot.config import settings
 from culinary_bot.db.models import Order
+from culinary_bot.services import cart as cart_service
 from culinary_bot.services import orders as order_service
 
 log = logging.getLogger(__name__)
@@ -64,11 +70,20 @@ async def confirm_due_orders(bot: Bot, sessionmaker: async_sessionmaker[AsyncSes
         return len(due)
 
 
+async def release_stock(sessionmaker: async_sessionmaker[AsyncSession], minutes: int) -> int:
+    """Один проход: снять просроченную бронь блюд вне лавки."""
+    async with sessionmaker() as session:
+        released = await cart_service.release_expired(session, minutes)
+        await session.commit()
+        return released
+
+
 async def run_confirmations(bot: Bot, sessionmaker: async_sessionmaker[AsyncSession], minutes: int) -> None:
-    """Бесконечный цикл фоновой задачи. Запускается из __main__.py."""
+    """Бесконечный цикл фоновых задач. Запускается из __main__.py."""
     while True:
         try:
             await confirm_due_orders(bot, sessionmaker, minutes)
+            await release_stock(sessionmaker, settings.stock_hold_minutes)
         except Exception:
             # Любая ошибка не должна убить задачу навсегда: пишем в журнал
             # и пробуем снова через 30 секунд.

@@ -22,10 +22,12 @@ from culinary_bot.bot.handlers import (
     admin_main,
     admin_orders,
     admin_setup,
+    admin_stock,
     client_checkout,
     client_menu,
     client_orders,
     client_profile,
+    client_stock,
     group,
     start,
 )
@@ -48,14 +50,14 @@ def build_router() -> Router:
     admin = Router(name="admin")
     admin.message.filter(IsAdmin())
     admin.callback_query.filter(IsAdmin())
-    for module in (admin_main, admin_setup, admin_fields, admin_catalog, admin_issues, admin_orders):
+    for module in (admin_main, admin_setup, admin_fields, admin_catalog, admin_stock, admin_issues, admin_orders):
         admin.include_router(module.router)
     private.include_router(admin)
 
     # client_orders раньше client_checkout: кнопка «Мои заказы» должна
     # сработать, даже если клиент бросил оформление на шаге «введите имя»,
     # а не записаться в имя.
-    for module in (client_orders, client_profile, client_menu, client_checkout):
+    for module in (client_orders, client_profile, client_stock, client_menu, client_checkout):
         private.include_router(module.router)
 
     root.include_router(private)

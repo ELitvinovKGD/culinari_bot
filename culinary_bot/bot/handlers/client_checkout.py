@@ -103,18 +103,31 @@ async def cb_privacy(callback: CallbackQuery, state: FSMContext, session: AsyncS
     if data.get("target") == "gift":
         await ask_recipient(callback.message, state, session, customer)
     else:
-        await ask_contact_or_saved(callback.message, state, customer)
+        await ask_contact_or_saved(callback.message, state, customer, allow_gift=data.get("target") != "stock_sep")
     await callback.answer()
 
 
-async def ask_contact_or_saved(message: Message, state: FSMContext, customer: Customer) -> None:
+async def start_stock_separate(message: Message, state: FSMContext, customer: Customer) -> None:
+    """
+    Отдельный заказ «🧺 В наличии» (без лавки): данные клиента → комментарий → заказ.
+    Вызывается из client_stock.py.
+    """
+    await state.clear()
+    await state.update_data(target="stock_sep")
+    if not customer.privacy_accepted:
+        await message.answer(texts.PRIVACY_NOTICE, reply_markup=keyboards.single("Понятно", "privacy"))
+    else:
+        await ask_contact_or_saved(message, state, customer, allow_gift=False)
+
+
+async def ask_contact_or_saved(message: Message, state: FSMContext, customer: Customer, allow_gift: bool = True) -> None:
     """Есть сохранённые данные — спросить «всё верно?», нет — начать ввод с имени."""
     if customer.has_saved_data():
         await message.answer(
             texts.saved_data_question(
                 customer.name, customer.phone, customer.delivery_type, customer.address, customer.latitude is not None
             ),
-            reply_markup=keyboards.saved_data(),
+            reply_markup=keyboards.saved_data(allow_gift=allow_gift),
         )
     else:
         await start_contact_input(message, state, customer, editing=False)
@@ -124,7 +137,8 @@ async def ask_contact_or_saved(message: Message, state: FSMContext, customer: Cu
 async def cb_data_ok(callback: CallbackQuery, state: FSMContext) -> None:
     """Сохранённые данные верны — сразу к комментарию."""
     await callback.message.edit_reply_markup(reply_markup=None)
-    await state.update_data(target="own")
+    if (await state.get_data()).get("target") != "stock_sep":
+        await state.update_data(target="own")
     await ask_comment(callback.message, state)
     await callback.answer()
 
@@ -133,7 +147,8 @@ async def cb_data_ok(callback: CallbackQuery, state: FSMContext) -> None:
 async def cb_data_edit(callback: CallbackQuery, state: FSMContext, customer: Customer) -> None:
     """Клиент хочет поменять свои данные — ввод заново, с кнопками «Оставить прежнее»."""
     await callback.message.edit_reply_markup(reply_markup=None)
-    await state.update_data(target="own")
+    if (await state.get_data()).get("target") != "stock_sep":
+        await state.update_data(target="own")
     await start_contact_input(callback.message, state, customer, editing=True)
     await callback.answer()
 
@@ -511,12 +526,16 @@ async def place(message: Message, state: FSMContext, session: AsyncSession, cust
     """
     data = await state.get_data()
     await state.clear()
+    target = data.get("target", "own")
+    if target in ("stock", "stock_sep"):
+        await place_stock(message, session, customer, data, comment)
+        return
+
     issue = await issue_service.get_open_issue(session)
     if issue is None:
         await message.answer(texts.ISSUE_CLOSED)
         return
 
-    target = data.get("target", "own")
     all_parts = await order_service.customer_issue_orders(session, customer, issue)
     recipient = None
     payer = None
@@ -550,6 +569,7 @@ async def place(message: Message, state: FSMContext, session: AsyncSession, cust
     summary = order_service.summarize_by_customer(parts + [order])[0]
     if base is None and not order.is_gift:
         await message.answer(texts.order_accepted(order), reply_markup=kb)
+        await offer_stock(message, session, issue)
     elif base is None:
         await message.answer(
             f"🎁 <b>Заказ получателю {texts.esc(order.name)} принят</b>\n\n{texts.summary_lines(summary)}\n\n"
@@ -559,6 +579,50 @@ async def place(message: Message, state: FSMContext, session: AsyncSession, cust
         )
     else:
         await message.answer(texts.order_added(summary), reply_markup=kb)
+
+
+async def place_stock(message: Message, session: AsyncSession, customer: Customer, data: dict, comment: str | None) -> None:
+    """Оформить «🧺 В наличии»: к заказу в лавке (stock_base) или отдельно."""
+    stock = await issue_service.get_stock_issue(session)
+    base = None
+    if data.get("target") == "stock":
+        try:
+            base = await order_service.get_order(session, data["stock_base"])
+        except (ServiceError, KeyError):
+            await message.answer(texts.SOMETHING_WRONG)
+            return
+    try:
+        order = await order_service.place_stock_order(session, customer, stock, comment, base=base)
+    except ServiceError as error:
+        await message.answer(str(error))
+        return
+    kb = await client_orders.order_keyboard(session, order)
+    if base is not None:
+        parts = [
+            o
+            for o in await order_service.customer_issue_orders(session, customer, base.issue)
+            if o.recipient_id == base.recipient_id
+        ]
+        summary = order_service.summarize_by_customer(parts)[0]
+        await message.answer(texts.order_added(summary), reply_markup=kb)
+    else:
+        await message.answer(
+            f"✅ <b>Заказ принят</b>\n\n{texts.order_lines(order)}\n\nИтого: {format_price(order.total_cents)}\n\n"
+            "Шеф напишет, когда будет готово к выдаче.",
+            reply_markup=kb,
+        )
+
+
+async def offer_stock(message: Message, session: AsyncSession, issue) -> None:
+    """
+    После заказа из лавки предложить «🧺 Ещё у шефа в наличии» — только если
+    есть блюда вне лавки, которых нет в самой лавке (например, наливка).
+    """
+    stock = await issue_service.get_stock_issue(session)
+    lavka_dishes = {item.dish_id for item in issue.items}
+    extra = [item for item in issue_service.stock_available(stock) if item.dish_id not in lavka_dishes]
+    if extra:
+        await message.answer(texts.stock_offer(extra), reply_markup=keyboards.stock_open())
 
 
 # Если в середине диалога прислали не текст (стикер, фото) — подсказываем.

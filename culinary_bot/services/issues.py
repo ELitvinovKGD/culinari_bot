@@ -15,6 +15,7 @@ from culinary_bot.db.models import (
     Dish,
     Issue,
     IssueItem,
+    IssueKind,
     IssueStatus,
     Order,
     OrderItem,
@@ -22,6 +23,7 @@ from culinary_bot.db.models import (
     utcnow,
 )
 from culinary_bot.services import ServiceError
+from culinary_bot.services.cart import return_stock
 
 # Поля позиции выпуска, которые шеф может менять (цена — отдельной функцией,
 # потому что у неё особое правило с уже оформленными заказами).
@@ -52,24 +54,85 @@ async def get_item(session: AsyncSession, item_id: int) -> IssueItem:
 
 
 async def get_open_issue(session: AsyncSession) -> Issue | None:
-    """Выпуск, который сейчас принимает заказы (он всегда один или ни одного)."""
-    return await session.scalar(select(Issue).where(Issue.status == IssueStatus.OPEN))
+    """Лавка, которая сейчас принимает заказы (она всегда одна или ни одной)."""
+    return await session.scalar(
+        select(Issue).where(Issue.status == IssueStatus.OPEN, Issue.kind == IssueKind.LAVKA)
+    )
 
 
 async def list_active_issues(session: AsyncSession) -> list[Issue]:
-    """Незавершённые выпуски (черновики, открытый, закрытые) — для админки."""
+    """Незавершённые лавки (черновики, открытая, закрытые) — для админки."""
     result = await session.scalars(
-        select(Issue).where(Issue.status != IssueStatus.FINISHED).order_by(Issue.id.desc())
+        select(Issue)
+        .where(Issue.status != IssueStatus.FINISHED, Issue.kind == IssueKind.LAVKA)
+        .order_by(Issue.id.desc())
     )
     return list(result)
 
 
 async def list_finished_issues(session: AsyncSession, limit: int = 10) -> list[Issue]:
-    """Последние завершённые выпуски (архив)."""
+    """Последние завершённые лавки (архив)."""
     result = await session.scalars(
-        select(Issue).where(Issue.status == IssueStatus.FINISHED).order_by(Issue.id.desc()).limit(limit)
+        select(Issue)
+        .where(Issue.status == IssueStatus.FINISHED, Issue.kind == IssueKind.LAVKA)
+        .order_by(Issue.id.desc())
+        .limit(limit)
     )
     return list(result)
+
+
+# ---------------------------------------------------------------------------
+# «🧺 Блюда вне лавки» (решение от 26.11)
+#
+# Устроены как ОДИН постоянный выпуск вида STOCK: он создаётся сам при первом
+# обращении и всегда открыт. Его позиции — блюда из общего каталога с остатком
+# (stock_left). Так переиспользуются корзина, заказы, Excel и посты лавки.
+# ---------------------------------------------------------------------------
+
+STOCK_TITLE = "Блюда вне лавки"
+
+
+async def get_stock_issue(session: AsyncSession) -> Issue:
+    """Постоянный выпуск «Блюда вне лавки»; создаётся при первом обращении."""
+    issue = await session.scalar(select(Issue).where(Issue.kind == IssueKind.STOCK))
+    if issue is None:
+        issue = Issue(title=STOCK_TITLE, kind=IssueKind.STOCK, status=IssueStatus.OPEN, opened_at=utcnow(), items=[])
+        session.add(issue)
+        await session.flush()
+    return issue
+
+
+def stock_available(issue: Issue) -> list[IssueItem]:
+    """Блюда вне лавки, которые сейчас можно заказать (в продаже и остаток > 0)."""
+    return [item for item in issue.items if item.is_active and (item.stock_left or 0) > 0]
+
+
+async def add_stock_dish(session: AsyncSession, issue: Issue, dish: Dish, quantity: int) -> IssueItem:
+    """
+    Выставить блюдо из каталога «в наличие» с количеством.
+
+    Если блюдо уже было — пополняем остаток и возвращаем в продажу
+    (цена и описание остаются те, что шеф выставил раньше).
+    """
+    if quantity < 1 or quantity > 1000:
+        raise ServiceError("Количество — от 1 до 1000.")
+    for item in issue.items:
+        if item.dish_id == dish.id:
+            item.stock_left = (item.stock_left or 0) + quantity
+            item.is_active = True
+            return item
+    item = await add_dish_to_issue(session, issue, dish)
+    item.stock_left = quantity
+    return item
+
+
+def set_stock(item: IssueItem, quantity: int) -> None:
+    """Задать остаток вручную («осталось 3»). Бронь в корзинах не трогаем."""
+    if not item.is_stock:
+        raise ServiceError("Остаток есть только у блюд вне лавки.")
+    if quantity < 0 or quantity > 1000:
+        raise ServiceError("Остаток — от 0 до 1000.")
+    item.stock_left = quantity
 
 
 def active_items(issue: Issue) -> list[IssueItem]:
@@ -114,7 +177,7 @@ async def create_draft(session: AsyncSession, title: str) -> Issue:
 
 
 def ensure_editable(issue: Issue) -> None:
-    """Править можно только черновик и открытый выпуск."""
+    """Править можно только черновик и открытый выпуск (блюда вне лавки — всегда открыты)."""
     if issue.status not in (IssueStatus.DRAFT, IssueStatus.OPEN):
         raise ServiceError("Закрытый или завершённый выпуск менять нельзя.")
 
@@ -208,7 +271,7 @@ async def set_item_active(session: AsyncSession, item: IssueItem, active: bool) 
     if not active:
         carts = await session.scalars(select(CartItem).where(CartItem.issue_item_id == item.id))
         for cart_item in carts:
-            await session.delete(cart_item)
+            await return_stock(session, cart_item)
     return await orders_with_item(session, item)
 
 

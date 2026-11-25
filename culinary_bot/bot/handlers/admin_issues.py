@@ -13,9 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from culinary_bot import texts
 from culinary_bot.bot import jobs, keyboards, publisher
 from culinary_bot.bot.callbacks import IssueCb, ItemCb, LeftCb
-from culinary_bot.bot.handlers import client_orders
+from culinary_bot.bot.handlers import admin_stock, client_orders
 from culinary_bot.bot.ui import replace_message
-from culinary_bot.db.models import DeliveryType, Issue, IssueItem, IssueStatus, OrderStatus, utcnow
+from culinary_bot.db.models import DeliveryType, Issue, IssueItem, IssueKind, IssueStatus, OrderStatus, utcnow
 from culinary_bot.services import ServiceError
 from culinary_bot.services import catalog as catalog_service
 from culinary_bot.services import export as export_service
@@ -48,7 +48,10 @@ class Leftovers(StatesGroup):
 
 
 async def send_issue(message: Message, session: AsyncSession, issue: Issue) -> None:
-    """Отправить экран выпуска с кнопками по его состоянию."""
+    """Отправить экран выпуска с кнопками по его состоянию (для «вне лавки» — свой экран)."""
+    if issue.kind == IssueKind.STOCK:
+        await admin_stock.send_stock(message, session, issue)
+        return
     orders = await order_service.issue_orders(session, issue, include_cancelled=False)
     total = sum(o.total_cents for o in orders)
     await message.answer(texts.issue_for_admin(issue, len(orders), total), reply_markup=keyboards.issue(issue))
@@ -410,6 +413,9 @@ async def cb_excel(callback: CallbackQuery, callback_data: IssueCb, session: Asy
     if not issue:
         return
     orders = await order_service.issue_orders(session, issue)
+    if issue.kind == IssueKind.STOCK:
+        # Вне лавки «выпуск» постоянный — в таблицу только ещё не отданные заказы.
+        orders = [o for o in orders if o.status == OrderStatus.ACCEPTED]
     content = export_service.build_issue_workbook(issue, orders)
     # Запоминаем время выгрузки: если потом придёт заказ, шеф получит
     # «⚠️ Таблица изменилась — пересоберите, если распечатали».

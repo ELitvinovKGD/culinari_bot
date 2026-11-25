@@ -239,6 +239,33 @@ async def cb_summary(callback: CallbackQuery, session: AsyncSession, customer: C
     all_orders = await existing_orders(session, customer, issue)
     own = next((s for s in all_orders if s.recipient_id is None), None)
     gifts = [(s.recipient_id, s.name) for s in all_orders if s.recipient_id is not None]
-    text = texts.summary_text(cart, cart_service.cart_total_cents(cart), own)
-    await replace_message(callback, text, keyboards.summary(has_own=own is not None, gifts=gifts))
+    total = cart_service.cart_total_cents(cart)
+    if gifts:
+        # Заказов несколько (себе и/или получателям) — сначала только «Куда добавить?»,
+        # «Уже заказано» покажем после выбора (решение от 26.11, вариант б).
+        await replace_message(callback, texts.where_to_add_text(cart, total), keyboards.where_to_add(own is not None, gifts))
+    else:
+        await replace_message(callback, texts.summary_text(cart, total, own), keyboards.summary(has_own=own is not None))
+    await callback.answer()
+
+
+@router.callback_query(CheckoutCb.filter(F.action == "pick_to"))
+async def cb_pick_to(callback: CallbackQuery, callback_data: CheckoutCb, session: AsyncSession, customer: Customer) -> None:
+    """Выбран заказ, к которому добавить: показать итог именно по нему."""
+    issue = await get_issue_for_callback(callback, session)
+    if issue is None:
+        return
+    cart = await cart_service.get_cart(session, customer, issue)
+    if not cart:
+        await callback.answer(texts.CART_EMPTY, show_alert=True)
+        return
+    rid = callback_data.rid or None
+    target = next((s for s in await existing_orders(session, customer, issue) if s.recipient_id == rid), None)
+    if target is None:
+        await callback.answer("Этот заказ уже нельзя дополнить.", show_alert=True)
+        return
+    text = texts.summary_text(cart, cart_service.cart_total_cents(cart), target)
+    if rid:
+        text = f"{texts.order_title(target)}\n\n{text}"
+    await replace_message(callback, text, keyboards.add_confirm(callback_data.rid))
     await callback.answer()

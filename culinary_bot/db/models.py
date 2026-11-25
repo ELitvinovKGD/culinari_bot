@@ -71,6 +71,19 @@ class IssueStatus(StrEnum):
     FINISHED = "finished"  # всё развезено, выпуск в архиве
 
 
+class IssueKind(StrEnum):
+    """
+    Вид выпуска.
+
+    LAVKA — обычная лавка: меню на один раз, приём открыт → закрыт → завершён.
+    STOCK — «🧺 Блюда вне лавки»: один постоянный «выпуск», который всегда
+    открыт; у его позиций есть остаток (сколько порций/банок ещё есть).
+    """
+
+    LAVKA = "lavka"
+    STOCK = "stock"
+
+
 class OrderStatus(StrEnum):
     """Статусы заказа."""
 
@@ -255,6 +268,7 @@ class Issue(Base):
     # Текст после списка блюд ("Доставку планирую в конце недели").
     footer: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(16), default=IssueStatus.DRAFT, index=True)
+    kind: Mapped[str] = mapped_column(String(16), default=IssueKind.LAVKA, server_default=IssueKind.LAVKA, index=True)
 
     # Последнее объявление выдачи («📣 Объявить выдачу»): текст для клиентов
     # с доставкой и отдельный — для самовывоза.
@@ -319,7 +333,17 @@ class IssueItem(Base):
     # False — снято с продажи ("закончилось"): клиенты больше не видят.
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
+    # Остаток — только у блюд вне лавки (у позиций лавки пусто = без ограничения).
+    # Уменьшается, когда клиент кладёт блюдо в корзину (бронь), и
+    # возвращается, если бронь снята или заказ отменён.
+    stock_left: Mapped[int | None] = mapped_column(Integer)
+
     issue: Mapped[Issue] = relationship(back_populates="items", lazy="selectin")
+
+    @property
+    def is_stock(self) -> bool:
+        """Позиция из «🧺 Блюд вне лавки» (с остатком)."""
+        return self.stock_left is not None
 
 
 class CartItem(Base):
@@ -339,6 +363,9 @@ class CartItem(Base):
     customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id", ondelete="CASCADE"))
     issue_item_id: Mapped[int] = mapped_column(ForeignKey("issue_items.id", ondelete="CASCADE"))
     quantity: Mapped[int] = mapped_column(Integer)
+    # Когда корзину меняли последний раз. Для блюд вне лавки корзина — это
+    # бронь: если час не оформлено, фоновая задача снимает бронь.
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
     issue_item: Mapped[IssueItem] = relationship(lazy="selectin")
 

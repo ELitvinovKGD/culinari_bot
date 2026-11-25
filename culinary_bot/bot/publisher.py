@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from culinary_bot import texts
 from culinary_bot.bot import keyboards
-from culinary_bot.db.models import Issue, Order, utcnow
+from culinary_bot.db.models import Issue, IssueKind, Order, utcnow
 from culinary_bot.services import admins as admin_service
 from culinary_bot.services import orders as order_service
 from culinary_bot.services import settings as settings_service
@@ -28,6 +28,11 @@ log = logging.getLogger(__name__)
 # Ограничения Telegram.
 CAPTION_LIMIT = 1024  # подпись к фото/альбому
 ALBUM_LIMIT = 10  # фото в одном альбоме
+
+
+def menu_payload(issue: Issue) -> str:
+    """Куда ведёт «Заказать» под постом: меню лавки или «🧺 В наличии»."""
+    return "stock" if issue.kind == IssueKind.STOCK else "menu"
 
 
 def deep_link(bot_username: str, payload: str) -> str:
@@ -87,8 +92,12 @@ async def send_menu_post(bot: Bot, chat_id: int, issue: Issue, bot_username: str
     Возвращает (все id сообщений, id сообщения с текстом, текст_это_подпись).
     Исключения Telegram НЕ ловит — решать, что делать при ошибке, вызывающему.
     """
-    link = deep_link(bot_username, "menu")
-    photos = [item.photo_file_id for item in issue.items if item.is_active and item.photo_file_id]
+    link = deep_link(bot_username, menu_payload(issue))
+    photos = [
+        item.photo_file_id
+        for item in issue.items
+        if item.is_active and item.photo_file_id and (not item.is_stock or (item.stock_left or 0) > 0)
+    ]
     plain_text = texts.menu_post_text(issue)
     button = keyboards.order_button(link)
 
@@ -133,8 +142,8 @@ async def update_menu_post(bot: Bot, session: AsyncSession, issue: Issue, bot_us
     if chat_id is None or issue.group_text_message_id is None:
         return "Пост в группе не найден — возможно, группа не подключена."
     try:
+        link = deep_link(bot_username, menu_payload(issue))
         if issue.group_text_is_caption:
-            link = deep_link(bot_username, "menu")
             # Если подпись у одиночного фото — кнопка есть, ссылка не нужна;
             # у альбома (несколько сообщений) — нужна ссылка в тексте.
             is_album = len(issue.group_message_ids or []) > 1
@@ -152,7 +161,7 @@ async def update_menu_post(bot: Bot, session: AsyncSession, issue: Issue, bot_us
                 chat_id=chat_id,
                 message_id=issue.group_text_message_id,
                 text=texts.menu_post_text(issue),
-                reply_markup=keyboards.order_button(deep_link(bot_username, "menu")),
+                reply_markup=keyboards.order_button(link),
             )
     except TelegramAPIError as error:
         # "message is not modified" — текст не изменился, это не ошибка.

@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     # открыто, шеф и группа о заказе не знают — уведомление и пост уходят после.
     order_edit_minutes: int = 10
 
+    # Сколько минут держится бронь «🧺 В наличии» в корзине без оформления заказа.
+    stock_hold_minutes: int = 60
+
     # Определять адрес по точке на карте через OpenStreetMap (интернет-сервис).
     # Выключается GEOCODING_ENABLED=0 — тогда остаётся только точка.
     geocoding_enabled: bool = True

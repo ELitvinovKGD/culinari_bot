@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from culinary_bot import texts
 from culinary_bot.bot import keyboards
 from culinary_bot.bot.callbacks import AdmCb, AdminsCb, SetCb
-from culinary_bot.bot.handlers import admin_setup
+from culinary_bot.bot.handlers import admin_setup, admin_stock
 from culinary_bot.bot.publisher import deep_link
 from culinary_bot.bot.ui import replace_message
 from culinary_bot.db.models import Admin
@@ -90,6 +90,8 @@ async def cb_section(
     elif section == "archived":
         dishes = await catalog_service.list_dishes(session, archived=True)
         await replace_message(callback, "<b>Архив блюд</b>", reply_markup=keyboards.catalog(dishes, archived=True))
+    elif section == "stock":
+        await admin_stock.send_stock(callback.message, session)
     elif section == "settings":
         pickup = await settings_service.is_pickup_enabled(session)
         await replace_message(callback, await settings_text(session), reply_markup=keyboards.settings(pickup))

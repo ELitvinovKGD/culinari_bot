@@ -74,15 +74,26 @@ def build_issue_workbook(issue: Issue, orders: list[Order]) -> bytes:
     Возвращает содержимое файла в байтах.
     """
     summaries = summarize_by_customer(orders)
+    # Блюда вне лавки, добавленные к заказам этой лавки (решение от 26.11):
+    # их нет в issue.items, но готовить/«докинуть» в пакет их надо.
+    # {id позиции: (название, порция, цена)} — берём из позиций заказов.
+    own_ids = {item.id for item in issue.items}
+    extras: dict[int, tuple[str, str | None, int]] = {}
+    for order in orders:
+        for item in order.items:
+            if item.issue_item_id is not None and not item.is_extra and item.issue_item_id not in own_ids:
+                extras[item.issue_item_id] = (item.name, item.portion, item.price_cents)
     wb = Workbook()
-    _production_sheet(wb.active, issue, summaries)
+    _production_sheet(wb.active, issue, summaries, extras)
     _delivery_sheet(wb.create_sheet("Доставка"), summaries)
     buffer = BytesIO()
     wb.save(buffer)
     return buffer.getvalue()
 
 
-def _production_sheet(ws: Worksheet, issue: Issue, summaries: list[CustomerSummary]) -> None:
+def _production_sheet(
+    ws: Worksheet, issue: Issue, summaries: list[CustomerSummary], extras: dict[int, tuple[str, str | None, int]]
+) -> None:
     """Лист «Производство»: что готовить и кто сколько платит."""
     ws.title = "Производство"
     last_col = FIRST_CLIENT_COL + len(summaries) - 1
@@ -120,6 +131,21 @@ def _production_sheet(ws: Worksheet, issue: Issue, summaries: list[CustomerSumma
         total_cell.font, total_cell.alignment = BIG_BOLD, CENTER
         for offset, qty in enumerate(per_customer):
             # 0 оставляем пустой клеткой — так таблицу легче читать глазами.
+            cell = ws.cell(row=row, column=FIRST_CLIENT_COL + offset, value=qty or None)
+            cell.alignment, cell.font = CENTER, BIG_BOLD
+        ws.row_dimensions[row].height = 28
+        row += 1
+
+    # --- Блюда вне лавки, добавленные к заказам («🧺 докинуть») ---
+    for item_id, (name, portion, price) in extras.items():
+        per_customer = [s.menu_quantities.get(item_id, 0) for s in summaries]
+        title = f"🧺 {name} {portion}" if portion else f"🧺 {name}"
+        ws.cell(row=row, column=1, value="🧺").alignment = CENTER
+        ws.cell(row=row, column=2, value=title).alignment = LEFT
+        ws.cell(row=row, column=3, value=euros(price)).alignment = CENTER
+        total_cell = ws.cell(row=row, column=4, value=sum(per_customer))
+        total_cell.font, total_cell.alignment = BIG_BOLD, CENTER
+        for offset, qty in enumerate(per_customer):
             cell = ws.cell(row=row, column=FIRST_CLIENT_COL + offset, value=qty or None)
             cell.alignment, cell.font = CENTER, BIG_BOLD
         ws.row_dimensions[row].height = 28

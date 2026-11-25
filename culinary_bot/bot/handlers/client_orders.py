@@ -14,7 +14,7 @@ from culinary_bot.bot.callbacks import MyOrderCb
 from culinary_bot.bot.handlers import client_menu
 from culinary_bot.bot.ui import replace_message
 from culinary_bot.config import settings
-from culinary_bot.db.models import Customer, IssueStatus, Order, OrderStatus
+from culinary_bot.db.models import Customer, IssueKind, IssueStatus, Order, OrderStatus
 from culinary_bot.services import ServiceError
 from culinary_bot.services import orders as order_service
 from culinary_bot.services import settings as settings_service
@@ -50,8 +50,14 @@ async def my_orders(message: Message, state: FSMContext, session: AsyncSession, 
         await message.answer("Заказов пока нет. Загляните в «🍽 Меню».")
         return
 
-    current = [o for o in orders if o.issue.status != IssueStatus.FINISHED]
-    past = [o for o in orders if o.issue.status == IssueStatus.FINISHED]
+    def is_current(order: Order) -> bool:
+        # Лавка — пока её не развезли. Блюда вне лавки — пока заказ не отдан.
+        if order.issue.kind == IssueKind.STOCK:
+            return order.status == OrderStatus.ACCEPTED
+        return order.issue.status != IssueStatus.FINISHED
+
+    current = [o for o in orders if is_current(o)]
+    past = [o for o in orders if not is_current(o)]
 
     # Группируем части: одна карточка на (выпуск, получатель) — заказ себе
     # и заказ для Маши показываются отдельно, добавки — внутри своего заказа.
