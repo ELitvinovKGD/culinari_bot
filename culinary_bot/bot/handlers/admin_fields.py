@@ -43,6 +43,7 @@ FIELD_PROMPTS: dict[str, str] = {
     "emoji": "Эмодзи блюда (один значок, например 🍲):",
     "description": "Описание:",
     "portion": "Порция (например «350/100 г» или «5 шт.»):",
+    "composition": "Состав — клиент увидит его по кнопке «📋 Состав».\nНапример: <i>горох, копчёные рёбрышки, картофель, морковь, лук</i>",
     "price_cents": "Цена в евро (например 10 или 10.5):",
     "photo_file_id": "Пришлите фото блюда:",
     "header": "Шапка поста — текст перед списком блюд:",
@@ -50,9 +51,13 @@ FIELD_PROMPTS: dict[str, str] = {
     "pickup_address": "Адрес самовывоза:",
     "order_post_header": "Первая строка поста о заказе (например «Поступил заказ на следующие позиции:»):",
     "order_post_footer": "Последняя строка поста о заказе (например «Спасибо за поддержку!»):",
+    "chef_contact": (
+        "Контакт для клиентов — ваш @username в Telegram.\n"
+        "Кнопки «✉️ Написать шефу» будут вести сюда.\nНапример: <i>@chef_anton</i>"
+    ),
 }
 # Поля, которые можно очистить (необязательные).
-CLEARABLE = {"emoji", "description", "portion", "photo_file_id", "header", "footer", "pickup_address"}
+CLEARABLE = {"emoji", "description", "portion", "composition", "photo_file_id", "header", "footer", "pickup_address", "chef_contact"}
 
 
 @router.callback_query(FieldCb.filter(F.clear.is_(False)))
@@ -157,12 +162,14 @@ async def apply_value(
             issue_service.update_item_field(item, field, value)
             await session.flush()
             # Описание/порция/название поменялись в открытом выпуске — уведомить клиентов (К8).
-            if item.issue.status == IssueStatus.OPEN and field in ("description", "portion", "name"):
+            if item.issue.status == IssueStatus.OPEN and field in ("description", "portion", "name", "composition"):
                 for order in await issue_service.orders_with_item(session, item):
                     await publisher.send_safe(bot, order.customer.tg_id, texts.item_changed(item, order))
             await admin_issues.send_item(message, session, item)
 
         elif entity == "setting":
+            if field == settings_service.CHEF_CONTACT and value is not None:
+                value = settings_service.normalize_username(str(value))
             await settings_service.set_value(session, field, value if value is None else str(value))
             await session.flush()
             await message.answer("Сохранено ✅", reply_markup=keyboards.admin_home())

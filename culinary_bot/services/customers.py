@@ -54,6 +54,8 @@ def save_contact(
     phone: str,
     delivery_type: DeliveryType,
     address: str | None,
+    latitude: float | None = None,
+    longitude: float | None = None,
 ) -> None:
     """
     Сохранить контактные данные клиента для следующих заказов.
@@ -66,7 +68,10 @@ def save_contact(
     customer.phone = phone
     customer.delivery_type = delivery_type
     # При самовывозе адрес не нужен — не храним лишних личных данных.
-    customer.address = address.strip() if (address and delivery_type == DeliveryType.DELIVERY) else None
+    is_delivery = delivery_type == DeliveryType.DELIVERY
+    customer.address = address.strip() if (address and is_delivery) else None
+    customer.latitude = latitude if is_delivery else None
+    customer.longitude = longitude if is_delivery else None
 
 
 async def delete_personal_data(session: AsyncSession, customer: Customer) -> None:
@@ -79,6 +84,8 @@ async def delete_personal_data(session: AsyncSession, customer: Customer) -> Non
     customer.name = None
     customer.phone = None
     customer.address = None
+    customer.latitude = None
+    customer.longitude = None
     customer.delivery_type = None
     customer.privacy_accepted = False
     carts = await session.scalars(select(CartItem).where(CartItem.customer_id == customer.id))

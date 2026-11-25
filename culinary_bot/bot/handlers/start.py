@@ -22,6 +22,7 @@ from culinary_bot.db.models import Customer
 from culinary_bot.services import ServiceError
 from culinary_bot.services import admins as admin_service
 from culinary_bot.services import customers as customer_service
+from culinary_bot.services import settings as settings_service
 
 router = Router(name="start")
 
@@ -69,6 +70,18 @@ async def btn_menu(message: Message, state: FSMContext, session: AsyncSession, c
     """Кнопка «🍽 Меню» — показать карусель текущего выпуска."""
     await state.clear()
     await client_menu.show_menu(message, session, customer)
+
+
+@router.message(F.text == texts.BTN_WRITE_CHEF)
+@router.message(Command("chef"))
+async def btn_write_chef(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    """«✉️ Написать шефу» — кнопка-ссылка в личку шефа (контакт из настроек)."""
+    await state.clear()
+    url = await settings_service.get_chef_contact_url(session)
+    if url is None:
+        await message.answer(texts.NO_CHEF_CONTACT)
+        return
+    await message.answer("Вопрос о составе, доставке или заказе — пишите шефу:", reply_markup=keyboards.url_button(texts.BTN_WRITE_CHEF, url))
 
 
 @router.message(Command("delete_me"))

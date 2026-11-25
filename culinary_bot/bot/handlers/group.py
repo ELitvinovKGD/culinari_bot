@@ -11,6 +11,9 @@ from aiogram.filters import Command
 from aiogram.types import Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from culinary_bot import texts
+from culinary_bot.bot import keyboards, publisher
+from culinary_bot.bot.callbacks import SetupCb
 from culinary_bot.services import settings as settings_service
 
 router = Router(name="group")
@@ -41,3 +44,11 @@ async def cmd_connect(message: Message, session: AsyncSession, is_admin: bool, b
 
     await settings_service.set_value(session, settings_service.GROUP_CHAT_ID, str(message.chat.id))
     await message.answer("Группа подключена ✅ Сюда будут публиковаться выпуски и заказы.")
+    # Пишем админу в личку: если он шёл по мастеру настройки — следующий шаг
+    # под рукой, возвращаться в бота и искать кнопку не нужно.
+    await publisher.send_safe(
+        bot,
+        message.from_user.id,
+        f"Группа «{texts.esc(message.chat.title)}» подключена ✅",
+        keyboards.setup_buttons(("Дальше: контакт для клиентов →", SetupCb(action="step", value="contact"))),
+    )

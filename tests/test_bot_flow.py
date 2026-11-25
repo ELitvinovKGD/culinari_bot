@@ -20,8 +20,8 @@ from datetime import datetime, timezone
 import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.methods import (
     EditMessageText,
     GetChatMember,
@@ -30,10 +30,11 @@ from aiogram.methods import (
     SendMediaGroup,
     TelegramMethod,
 )
-from aiogram.types import CallbackQuery, Chat, ChatMemberAdministrator, Message, PhotoSize, Update, User
+from aiogram.types import CallbackQuery, Chat, ChatMemberAdministrator, Location, Message, PhotoSize, Update, User
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
+from culinary_bot.bot import jobs
 from culinary_bot.bot.callbacks import AdmCb, CardCb, CheckoutCb, DishCb, FieldCb, IssueCb, ListCb, MyOrderCb
 from culinary_bot.bot.handlers import build_router
 from culinary_bot.bot.middlewares import ActorMiddleware, DbSessionMiddleware
@@ -110,13 +111,22 @@ def fake_message(chat_id, text: str = "", user_id: int | None = None, photo: boo
 
 
 class Harness:
-    """Удобные методы «пользователь пишет» и «пользователь нажимает кнопку»."""
+    """Удобные методы «пользователь пишет», «нажимает кнопку», «прошло 10 минут»."""
 
     def __init__(self, dp: Dispatcher, bot: Bot, fake: FakeSession) -> None:
         self.dp, self.bot, self.fake = dp, bot, fake
 
     async def send(self, user_id: int, text: str, chat_id: int | None = None) -> None:
         msg = fake_message(chat_id or user_id, text, user_id)
+        await self.dp.feed_update(self.bot, Update(update_id=next(_ids), message=msg))
+
+    async def time_passes(self) -> None:
+        """Окно правки истекло: фоновая задача подтверждает заказы (minutes=0 — сразу)."""
+        await jobs.confirm_due_orders(self.bot, self.maker, minutes=0)
+
+    async def location(self, user_id: int, lat: float, lon: float) -> None:
+        """Клиент отправил точку на карте."""
+        msg = fake_message(user_id, user_id=user_id).model_copy(update={"text": None, "location": Location(latitude=lat, longitude=lon)})
         await self.dp.feed_update(self.bot, Update(update_id=next(_ids), message=msg))
 
     async def click(self, user_id: int, data, photo: bool = False) -> None:
@@ -172,6 +182,7 @@ async def test_full_issue_flow(harness):
         await h.send(OWNER, name)  # название
         await h.click(OWNER, DishCb(action="skip"))  # эмодзи
         await h.send(OWNER, "Очень вкусно")  # описание
+        await h.send(OWNER, "горох, рёбрышки, лук")  # состав
         await h.send(OWNER, "700 г")  # порция
         await h.send(OWNER, price)  # цена
         await h.click(OWNER, DishCb(action="skip"))  # фото
@@ -182,13 +193,14 @@ async def test_full_issue_flow(harness):
     # --- Шеф: выпуск ----------------------------------------------------
     await h.click(OWNER, IssueCb(action="new"))
     await h.send(OWNER, "GREAT HITS")
+    await h.send(OWNER, "Last call, хомячки мои!")  # шапка спрашивается сразу после названия
     async with h.maker() as s:
         issue = await s.scalar(select(Issue))
+        assert issue.header == "Last call, хомячки мои!"
     for d in dishes:
         await h.click(OWNER, IssueCb(action="add_dish", issue_id=issue.id, dish_id=d.id))
-    await h.click(OWNER, FieldCb(entity="issue", obj_id=issue.id, field="header"))
-    await h.send(OWNER, "Last call, хомячки мои!")
     await h.click(OWNER, IssueCb(action="preview", issue_id=issue.id))
+    assert "Всё верно?" in h.fake.texts()[-1]  # кнопки под предпросмотром
 
     # Публикация без группы — отказ; подключаем группу и публикуем.
     await h.click(OWNER, IssueCb(action="publish", issue_id=issue.id))
@@ -202,6 +214,8 @@ async def test_full_issue_flow(harness):
 
     # --- Клиент заказывает ---------------------------------------------
     await h.send(CLIENT, "/start menu")
+    await h.click(CLIENT, CardCb(action="comp", index=0, item_id=soup.id))
+    assert any("Состав: горох" in t for t in h.fake.texts())
     await h.click(CLIENT, CardCb(action="plus", index=0, item_id=soup.id))
     await h.click(CLIENT, CardCb(action="show", index=1))
     await h.click(CLIENT, CheckoutCb(action="list"))
@@ -214,13 +228,23 @@ async def test_full_issue_flow(harness):
     await h.send(CLIENT, "abc")  # неверный телефон — бот переспросит
     await h.send(CLIENT, "+995 555 123 456")
     await h.click(CLIENT, CheckoutCb(action="delivery"))
-    await h.send(CLIENT, "ул. Руставели 1, кв 5")
+    await h.location(CLIENT, 42.28, 18.84)  # точка на карте
+    await h.send(CLIENT, "подъезд 2, этаж 3")  # уточнение
     await h.send(CLIENT, "позвонить за час")
 
     async with h.maker() as s:
         order = await s.scalar(select(Order))
         assert order is not None, "заказ не создан"
         assert order.total_cents == 1000 + 2 * 1250
+        assert order.map_url and order.address == "подъезд 2, этаж 3"
+        assert order.group_message_id is None  # окно правки: пост ещё не отправлен
+    assert not any("Новый заказ" in t for t in h.fake.texts())
+    assert "№" not in [t for t in h.fake.texts() if "Ваш заказ принят" in t][0]  # клиенту без номера
+
+    await h.time_passes()
+    async with h.maker() as s:
+        order = await s.get(Order, order.id)
+        assert order.confirmed_at is not None
         assert order.group_message_id is not None  # пост в группе опубликован
     sent = "\n".join(h.fake.texts())
     assert "Поступил заказ" in sent
@@ -247,6 +271,18 @@ async def test_full_issue_flow(harness):
         orders = list(await s.scalars(select(Order).order_by(Order.id)))
         assert len(orders) == 2 and orders[1].status == OrderStatus.ACCEPTED
 
+    # «✏️ Изменить» в окне правки: заказ уходит обратно в корзину, затем оформляем снова.
+    await h.click(CLIENT, MyOrderCb(action="edit", order_id=orders[1].id))
+    async with h.maker() as s:
+        assert await s.get(Order, orders[1].id) is None
+    await h.click(CLIENT, ListCb(action="next"))
+    await h.click(CLIENT, CheckoutCb(action="confirm"))
+    await h.click(CLIENT, CheckoutCb(action="data_ok"))
+    await h.click(CLIENT, CheckoutCb(action="skip"))
+    async with h.maker() as s:
+        orders = list(await s.scalars(select(Order).order_by(Order.id)))
+        assert len(orders) == 2 and orders[1].status == OrderStatus.ACCEPTED
+
     # --- Чужой клиент не может отменить чужой заказ --------------------
     await h.click(3, MyOrderCb(action="cancel_yes", order_id=orders[1].id))
     async with h.maker() as s:
@@ -260,11 +296,20 @@ async def test_full_issue_flow(harness):
     # --- Шеф: Excel, закрытие приёма, завершение ------------------------
     await h.click(OWNER, IssueCb(action="excel", issue_id=issue.id))
     await h.click(OWNER, IssueCb(action="close", issue_id=issue.id))
-    await h.send(OWNER, "Всё готово, развожу во вторник")
     await h.click(OWNER, IssueCb(action="close_yes", issue_id=issue.id))
     async with h.maker() as s:
         assert (await s.get(Issue, issue.id)).status == IssueStatus.CLOSED
-    assert any("развожу во вторник" in t and "Итого" in t for t in h.fake.texts())
+        # Неподтверждённый (в окне правки) заказ подтверждён сразу при закрытии.
+        assert (await s.get(Order, orders[1].id)).confirmed_at is not None
+    assert any("Приём заказов" in t and "закрыт" in t for t in h.fake.texts())
+    # Первый заказ клиент отменил, поэтому этот — «Новый заказ», а не дозаказ.
+    # Excel уже скачивали — в уведомлении предупреждение.
+    assert any("Новый заказ" in t and "Таблица изменилась" in t for t in h.fake.texts())
+
+    await h.click(OWNER, IssueCb(action="announce", issue_id=issue.id))
+    await h.send(OWNER, "Всё готово, развожу во вторник")
+    await h.click(OWNER, IssueCb(action="announce_yes", issue_id=issue.id))
+    assert any("развожу во вторник" in t and "К оплате" in t for t in h.fake.texts())
 
     await h.click(OWNER, IssueCb(action="finish_yes", issue_id=issue.id))
     async with h.maker() as s:
@@ -284,12 +329,13 @@ async def test_admin_tools(harness):
     # Быстрая подготовка: блюдо, выпуск, группа, публикация.
     await h.click(OWNER, DishCb(action="new"))
     await h.send(OWNER, "Суп")
-    for _ in range(3):
+    for _ in range(4):  # эмодзи, описание, состав, порция
         await h.click(OWNER, DishCb(action="skip"))
     await h.send(OWNER, "10")
     await h.click(OWNER, DishCb(action="skip"))
     await h.click(OWNER, IssueCb(action="new"))
     await h.send(OWNER, "Выпуск")
+    await h.click(OWNER, IssueCb(action="view", issue_id=1))  # «Пропустить» шапку
     async with h.maker() as s:
         issue = await s.scalar(select(Issue))
         dish = await s.scalar(select(Dish))
@@ -313,6 +359,7 @@ async def test_admin_tools(harness):
     async with h.maker() as s:
         order = await s.scalar(select(Order))
     assert order.total_cents == 2000
+    await h.time_passes()
 
     # Шеф меняет цену и применяет к заказам.
     await h.click(OWNER, FieldCb(entity="item", obj_id=item.id, field="price_cents"))
@@ -333,11 +380,20 @@ async def test_admin_tools(harness):
     async with h.maker() as s:
         assert (await s.get(Order, order.id)).total_cents == 2400 + 800
 
-    # Лишние порции из уведомления об отмене.
+    # Лишние порции: без контакта шефа публикация не проходит.
+    await h.click(OWNER, IssueCb(action="leftovers_from", issue_id=issue.id, order_id=order.id))
+    await h.click(OWNER, LeftCb(action="plus", item_id=item.id))
+    await h.click(OWNER, LeftCb(action="publish"))
+    assert not any("Остались свободные порции" in t for t in h.fake.texts())
+    # Указываем контакт в настройках — кнопка «Написать шефу» ведёт к шефу.
+    await h.click(OWNER, FieldCb(entity="setting", field="chef_contact"))
+    await h.send(OWNER, "https://t.me/chef_anton")
     await h.click(OWNER, IssueCb(action="leftovers_from", issue_id=issue.id, order_id=order.id))
     await h.click(OWNER, LeftCb(action="plus", item_id=item.id))
     await h.click(OWNER, LeftCb(action="publish"))
     assert any("Остались свободные порции" in t and "— 3" in t for t in h.fake.texts())
+    leftovers_call = [c for c in h.fake.calls if "Остались свободные порции" in (getattr(c, "text", "") or "")][-1]
+    assert leftovers_call.reply_markup.inline_keyboard[0][0].url == "https://t.me/chef_anton"
 
     # Снять блюдо с продажи — клиент получает уведомление.
     await h.click(OWNER, ItemCb(action="off", item_id=item.id))
@@ -360,3 +416,32 @@ async def test_admin_tools(harness):
     for section in ("home", "issues", "archive", "catalog", "archived", "settings", "admins", "notify"):
         await h.click(OWNER, AdmCb(section=section))
         await h.click(OWNER, AdmCb(section=section), photo=True)
+
+
+
+async def test_setup_wizard(harness):
+    """Мастер первой настройки: группа → контакт → самовывоз, чек-лист сворачивается."""
+    from culinary_bot.bot.callbacks import SetupCb
+
+    h = harness
+    await h.send(OWNER, "/admin")
+    assert any("Готовность лавки" in t for t in h.fake.texts())
+    assert any("ещё не настроена" in t for t in h.fake.texts())
+
+    await h.click(OWNER, SetupCb(action="step", value="group"))
+    await h.send(OWNER, "/connect", chat_id=GROUP)
+    assert any("подключена ✅" in t for t in h.fake.texts())
+    await h.click(OWNER, SetupCb(action="step", value="contact"))
+    await h.send(OWNER, "шеф")  # не username — бот переспросит
+    await h.send(OWNER, "@chef_anton")
+    await h.click(OWNER, SetupCb(action="pickup_yes"))
+    await h.send(OWNER, "Будва, ул. Морская 5")
+    assert any("Готово, основное настроено" in t for t in h.fake.texts())
+
+    # Ещё нет блюд и выпусков — чек-лист пока виден.
+    await h.send(OWNER, "/admin")
+    assert "Готовность лавки" in h.fake.texts()[-1]
+
+    # Клиент: «✉️ Написать шефу» ведёт на контакт.
+    await h.send(CLIENT, "✉️ Написать шефу")
+    assert h.fake.calls[-1].reply_markup.inline_keyboard[0][0].url == "https://t.me/chef_anton"

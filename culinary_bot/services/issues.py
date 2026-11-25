@@ -25,7 +25,7 @@ from culinary_bot.services import ServiceError
 
 # Поля позиции выпуска, которые шеф может менять (цена — отдельной функцией,
 # потому что у неё особое правило с уже оформленными заказами).
-EDITABLE_ITEM_FIELDS = {"name", "emoji", "description", "portion", "photo_file_id"}
+EDITABLE_ITEM_FIELDS = {"name", "emoji", "description", "portion", "composition", "photo_file_id"}
 # Поля самого выпуска.
 EDITABLE_ISSUE_FIELDS = {"title", "header", "footer"}
 
@@ -148,6 +148,7 @@ async def add_dish_to_issue(session: AsyncSession, issue: Issue, dish: Dish) -> 
         name=dish.name,
         description=dish.description,
         portion=dish.portion,
+        composition=dish.composition,
         price_cents=dish.price_cents,
         photo_file_id=dish.photo_file_id,
     )
@@ -270,23 +271,39 @@ async def open_issue(session: AsyncSession, issue: Issue) -> None:
     issue.opened_at = utcnow()
 
 
-async def close_issue(session: AsyncSession, issue: Issue, closing_text: str) -> None:
+async def close_issue(session: AsyncSession, issue: Issue) -> None:
     """
     Закрыть приём заказов: открыт → закрыт.
 
-    Корзины всех клиентов по этому выпуску очищаются: заказывать больше нельзя.
-    Рассылку клиентам делает обработчик (ему нужен Telegram).
+    Только останавливает заказы (решение от 25.11). Сообщение «приём закрыт»
+    клиентам рассылает обработчик; когда еда будет готова, шеф отдельно
+    нажмёт «📣 Объявить выдачу» (announce).
+    Корзины всех клиентов по этому выпуску очищаются.
     """
     if issue.status != IssueStatus.OPEN:
         raise ServiceError("Закрыть можно только открытый выпуск.")
     issue.status = IssueStatus.CLOSED
     issue.closed_at = utcnow()
-    issue.closing_text = closing_text
     item_ids = [item.id for item in issue.items]
     if item_ids:
         carts = await session.scalars(select(CartItem).where(CartItem.issue_item_id.in_(item_ids)))
         for cart_item in carts:
             await session.delete(cart_item)
+
+
+def announce(issue: Issue, delivery_text: str | None, pickup_text: str | None) -> None:
+    """
+    Запомнить объявление выдачи («Всё готово, развожу во вторник»).
+
+    Рассылку делает обработчик. Объявлять можно повторно («Задерживаюсь на час») —
+    каждый раз сохраняется последний текст.
+    """
+    if issue.status != IssueStatus.CLOSED:
+        raise ServiceError("Объявить выдачу можно после закрытия приёма.")
+    if not (delivery_text or pickup_text):
+        raise ServiceError("Текст объявления пустой.")
+    issue.closing_text = delivery_text
+    issue.pickup_text = pickup_text
 
 
 def finish_issue(issue: Issue, orders: list[Order], *, mark_delivered: bool) -> None:

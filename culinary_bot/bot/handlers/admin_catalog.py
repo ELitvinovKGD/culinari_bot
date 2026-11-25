@@ -31,6 +31,7 @@ class NewDish(StatesGroup):
     name = State()
     emoji = State()
     description = State()
+    composition = State()
     portion = State()
     price = State()
     photo = State()
@@ -49,6 +50,13 @@ STEPS = [
         NewDish.description,
         "description",
         "Описание — одна-две фразы.\nНапример: <i>Плотный суп с жареной грудинкой.</i>",
+        True,
+    ),
+    (
+        NewDish.composition,
+        "composition",
+        "Состав — клиент увидит его по кнопке «📋 Состав», в пост не попадёт.\n"
+        "Например: <i>горох, копчёные рёбрышки, картофель, лук</i>",
         True,
     ),
     (NewDish.portion, "portion", "Порция — вес или количество.\nНапример: <i>700 г</i>, <i>350/100 г</i> или <i>5 шт.</i>", True),
@@ -70,6 +78,8 @@ def dish_caption(dish: Dish) -> str:
     if dish.description:
         lines.append(texts.esc(dish.description))
     price = format_price(dish.price_cents)
+    if dish.composition:
+        lines.append(f"<i>Состав: {texts.esc(dish.composition)}</i>")
     lines.append(f"{texts.esc(dish.portion)} / {price}" if dish.portion else price)
     if dish.is_archived:
         lines.append("\n🗄 <i>В архиве</i>")
@@ -143,6 +153,7 @@ async def next_step(message: Message, state: FSMContext, session: AsyncSession) 
             emoji=data.get("emoji"),
             description=data.get("description"),
             portion=data.get("portion"),
+            composition=data.get("composition"),
             photo_file_id=data.get("photo_file_id"),
         )
         await message.answer("Блюдо сохранено в каталоге ✅")
@@ -162,6 +173,7 @@ async def next_step(message: Message, state: FSMContext, session: AsyncSession) 
 @router.message(F.text == "/cancel", NewDish.name)
 @router.message(F.text == "/cancel", NewDish.emoji)
 @router.message(F.text == "/cancel", NewDish.description)
+@router.message(F.text == "/cancel", NewDish.composition)
 @router.message(F.text == "/cancel", NewDish.portion)
 @router.message(F.text == "/cancel", NewDish.price)
 @router.message(F.text == "/cancel", NewDish.photo)
@@ -206,6 +218,7 @@ async def on_price(message: Message, state: FSMContext, session: AsyncSession) -
 @router.message(NewDish.name, F.text)
 @router.message(NewDish.emoji, F.text)
 @router.message(NewDish.description, F.text)
+@router.message(NewDish.composition, F.text)
 @router.message(NewDish.portion, F.text)
 async def on_text_step(message: Message, state: FSMContext, session: AsyncSession) -> None:
     """Текстовые шаги. «-» — пропустить необязательный шаг."""

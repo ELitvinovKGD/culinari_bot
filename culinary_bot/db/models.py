@@ -30,6 +30,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Integer,
     String,
@@ -112,6 +113,10 @@ class Customer(Base):
     phone: Mapped[str | None] = mapped_column(String(32))
     delivery_type: Mapped[str | None] = mapped_column(String(16))
     address: Mapped[str | None] = mapped_column(Text)
+    # Точка на карте, если клиент отправил геопозицию вместо (или вместе с) адресом.
+    # Float здесь допустим: координаты — не деньги, крошечная неточность не важна.
+    latitude: Mapped[float | None] = mapped_column(Float)
+    longitude: Mapped[float | None] = mapped_column(Float)
 
     # Видел ли клиент уведомление о личных данных (показываем один раз).
     privacy_accepted: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -124,8 +129,8 @@ class Customer(Base):
         """Есть ли сохранённые данные, чтобы предложить «Ваши данные, всё верно?»."""
         if not (self.name and self.phone and self.delivery_type):
             return False
-        # Для доставки обязателен адрес, для самовывоза — нет.
-        return self.delivery_type == DeliveryType.PICKUP or bool(self.address)
+        # Для доставки обязателен адрес или точка на карте, для самовывоза — нет.
+        return self.delivery_type == DeliveryType.PICKUP or bool(self.address) or self.latitude is not None
 
 
 class Admin(Base):
@@ -190,6 +195,8 @@ class Dish(Base):
     description: Mapped[str | None] = mapped_column(Text)
     # Порция — свободный текст: "350/100 г", "5 шт.", "700 г".
     portion: Mapped[str | None] = mapped_column(String(100))
+    # Состав — показывается клиенту по кнопке «📋 Состав», в пост группы не идёт.
+    composition: Mapped[str | None] = mapped_column(Text)
     price_cents: Mapped[int] = mapped_column(Integer)
     # file_id — идентификатор фото на серверах Telegram. Сам файл мы не храним:
     # Telegram отдаёт его по file_id, сколько угодно раз.
@@ -214,8 +221,13 @@ class Issue(Base):
     footer: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(16), default=IssueStatus.DRAFT, index=True)
 
-    # Текст, который шеф написал при закрытии приёма ("Развожу во вторник").
+    # Последнее объявление выдачи («📣 Объявить выдачу»): текст для клиентов
+    # с доставкой и отдельный — для самовывоза.
     closing_text: Mapped[str | None] = mapped_column(Text)
+    pickup_text: Mapped[str | None] = mapped_column(Text)
+    # Когда последний раз скачивали Excel. Если после этого пришёл заказ,
+    # шеф получит предупреждение «таблица изменилась — пересоберите».
+    excel_exported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     # Где лежит пост выпуска в группе — чтобы потом его обновить.
     # JSON-список ID сообщений (альбом — это несколько сообщений).
@@ -265,6 +277,7 @@ class IssueItem(Base):
     name: Mapped[str] = mapped_column(String(200))
     description: Mapped[str | None] = mapped_column(Text)
     portion: Mapped[str | None] = mapped_column(String(100))
+    composition: Mapped[str | None] = mapped_column(Text)
     price_cents: Mapped[int] = mapped_column(Integer)
     photo_file_id: Mapped[str | None] = mapped_column(String(255))
 
@@ -323,7 +336,14 @@ class Order(Base):
     username: Mapped[str | None] = mapped_column(String(64))
     delivery_type: Mapped[str] = mapped_column(String(16))
     address: Mapped[str | None] = mapped_column(Text)
+    latitude: Mapped[float | None] = mapped_column(Float)
+    longitude: Mapped[float | None] = mapped_column(Float)
     comment: Mapped[str | None] = mapped_column(Text)
+
+    # Когда заказ «сформирован»: через 10 минут после оформления (время на правку)
+    # или раньше, если шеф закрыл приём. Пока None — клиент может нажать
+    # «✏️ Изменить», а шеф и группа о заказе ещё не знают.
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
 
     # Пост о заказе в группе: ID сообщения и время отправки
     # (удалить пост Telegram позволяет только в течение 48 часов).
@@ -346,6 +366,13 @@ class Order(Base):
         cascade="all, delete-orphan",
         lazy="selectin",
     )
+
+    @property
+    def map_url(self) -> str | None:
+        """Ссылка на точку в Google Maps, если клиент отправил геопозицию."""
+        if self.latitude is None or self.longitude is None:
+            return None
+        return f"https://maps.google.com/?q={self.latitude:.6f},{self.longitude:.6f}"
 
     @property
     def total_cents(self) -> int:

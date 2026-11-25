@@ -25,6 +25,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 
 from culinary_bot.bot.handlers import build_router
+from culinary_bot.bot.jobs import run_confirmations
 from culinary_bot.bot.middlewares import ActorMiddleware, DbSessionMiddleware
 from culinary_bot.config import settings
 from culinary_bot.db.base import create_engine_and_sessionmaker
@@ -71,15 +72,21 @@ async def main() -> None:
             BotCommand(command="start", description="Начать"),
             BotCommand(command="menu", description="Меню текущего выпуска"),
             BotCommand(command="orders", description="Мои заказы"),
+            BotCommand(command="chef", description="Написать шефу"),
             BotCommand(command="delete_me", description="Удалить мои данные"),
         ]
     )
+
+    # Фоновая задача: подтверждать заказы после окна правки (см. bot/jobs.py).
+    # create_task запускает её «параллельно» с приёмом сообщений.
+    confirmations = asyncio.create_task(run_confirmations(bot, sessionmaker, settings.order_edit_minutes))
 
     log.info("Бот @%s запущен", me.username)
     try:
         # allowed_updates — получать только те типы событий, которые мы обрабатываем.
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        confirmations.cancel()
         # Аккуратно закрываем соединения при остановке (Ctrl+C или docker stop).
         await bot.session.close()
         await engine.dispose()

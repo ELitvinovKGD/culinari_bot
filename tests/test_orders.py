@@ -52,7 +52,7 @@ async def test_cannot_order_from_closed_issue(session, open_issue):
     """К1, особый случай: пока клиент оформлял, шеф закрыл приём."""
     customer = await make_customer(session)
     await cart.change_quantity(session, customer, open_issue.items[0], +1)
-    await issues.close_issue(session, open_issue, "Развожу во вторник")
+    await issues.close_issue(session, open_issue)
 
     with pytest.raises(ServiceError):
         await orders.place_order(session, customer, open_issue, comment=None)
@@ -132,7 +132,7 @@ async def test_finish_requires_delivery_marks(session, open_issue):
     customer = await make_customer(session)
     await cart.change_quantity(session, customer, open_issue.items[0], +1)
     order = await orders.place_order(session, customer, open_issue, comment=None)
-    await issues.close_issue(session, open_issue, "Развожу")
+    await issues.close_issue(session, open_issue)
     all_orders = await orders.issue_orders(session, open_issue)
 
     with pytest.raises(ServiceError):
@@ -177,3 +177,70 @@ def test_bad_phone(bad):
 def test_good_phone():
     assert normalize_phone(" 557692377 ") == "557692377"
     assert normalize_phone("+995 (557) 69-23-77") == "+995 (557) 69-23-77"
+
+
+async def test_edit_window(session, open_issue):
+    """«✏️ Изменить»: в окне правки заказ возвращается в корзину; после подтверждения — нельзя."""
+    customer = await make_customer(session)
+    soup = open_issue.items[0]
+    await cart.change_quantity(session, customer, soup, +1)
+    order = await orders.place_order(session, customer, open_issue, comment=None)
+    await cart.change_quantity(session, customer, soup, +1)  # в корзине уже 1 суп
+
+    assert orders.is_editable(order, minutes=10)
+    await orders.revert_to_cart(session, order, minutes=10)
+
+    basket = await cart.get_cart(session, customer, open_issue)
+    assert cart.quantities(basket) == {soup.id: 2}  # 1 из корзины + 1 из заказа
+    assert await orders.issue_orders(session, open_issue) == []  # заказ удалён
+
+    second = await orders.place_order(session, customer, open_issue, comment=None)
+    orders.mark_confirmed(second)
+    with pytest.raises(ServiceError):
+        await orders.revert_to_cart(session, second, minutes=10)
+
+
+async def test_orders_to_confirm(session, open_issue):
+    """Фоновая задача берёт только заказы с истёкшим окном и без подтверждения."""
+    customer = await make_customer(session)
+    await cart.change_quantity(session, customer, open_issue.items[0], +1)
+    order = await orders.place_order(session, customer, open_issue, comment=None)
+
+    assert await orders.orders_to_confirm(session, minutes=10) == []  # окно ещё идёт
+    assert [o.id for o in await orders.orders_to_confirm(session, minutes=0)] == [order.id]
+    orders.mark_confirmed(order)
+    assert await orders.orders_to_confirm(session, minutes=0) == []
+
+
+async def test_is_reorder(session, open_issue):
+    customer = await make_customer(session)
+    soup = open_issue.items[0]
+    await cart.change_quantity(session, customer, soup, +1)
+    first = await orders.place_order(session, customer, open_issue, comment=None)
+    await cart.change_quantity(session, customer, soup, +1)
+    second = await orders.place_order(session, customer, open_issue, comment=None)
+    assert not await orders.is_reorder(session, first)
+    assert await orders.is_reorder(session, second)
+
+
+async def test_announce_only_after_close(session, open_issue):
+    with pytest.raises(ServiceError):
+        issues.announce(open_issue, "Развожу во вторник", None)
+    await issues.close_issue(session, open_issue)
+    issues.announce(open_issue, "Развожу во вторник", "Забрать в среду")
+    assert open_issue.pickup_text == "Забрать в среду"
+
+
+@pytest.mark.parametrize("raw", ["@chef_anton", "chef_anton", "t.me/chef_anton", "https://t.me/chef_anton/"])
+def test_normalize_username(raw):
+    from culinary_bot.services.settings import normalize_username
+
+    assert normalize_username(raw) == "chef_anton"
+
+
+@pytest.mark.parametrize("bad", ["@ab", "шеф", "chef anton"])
+def test_bad_username(bad):
+    from culinary_bot.services.settings import normalize_username
+
+    with pytest.raises(ServiceError):
+        normalize_username(bad)

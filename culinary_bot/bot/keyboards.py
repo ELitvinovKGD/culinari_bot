@@ -30,6 +30,7 @@ from culinary_bot.bot.callbacks import (
     ListCb,
     MyOrderCb,
     SetCb,
+    SetupCb,
 )
 from culinary_bot.db.models import Admin, Dish, Issue, IssueItem, IssueStatus, Order, OrderStatus
 from culinary_bot.services.money import format_price
@@ -41,7 +42,10 @@ from culinary_bot.services.money import format_price
 
 def main_menu(is_admin: bool) -> ReplyKeyboardMarkup:
     """Нижняя клавиатура: «Меню», «Мои заказы» и для админов — «Админка»."""
-    rows = [[KeyboardButton(text=texts.BTN_MENU), KeyboardButton(text=texts.BTN_MY_ORDERS)]]
+    rows = [
+        [KeyboardButton(text=texts.BTN_MENU), KeyboardButton(text=texts.BTN_MY_ORDERS)],
+        [KeyboardButton(text=texts.BTN_WRITE_CHEF)],
+    ]
     if is_admin:
         rows.append([KeyboardButton(text=texts.BTN_ADMIN)])
     # resize_keyboard — кнопки компактные, а не на пол-экрана.
@@ -64,8 +68,20 @@ def card(index: int, total: int, item: IssueItem, qty: int, cart_text: str) -> I
     kb.button(text="←", callback_data=CardCb(action="show", index=(index - 1) % total))
     kb.button(text=f"{index + 1}/{total}", callback_data=CardCb(action="noop", index=index))
     kb.button(text="→", callback_data=CardCb(action="show", index=(index + 1) % total))
+    sizes = [3, 3]
+    if item.composition:
+        kb.button(text="📋 Состав", callback_data=CardCb(action="comp", index=index, item_id=item.id))
+        sizes.append(1)
     kb.button(text=cart_text, callback_data=CheckoutCb(action="list"))
-    kb.adjust(3, 3, 1)
+    sizes.append(1)
+    kb.adjust(*sizes)
+    return kb.as_markup()
+
+
+def hide_message(index: int) -> InlineKeyboardMarkup:
+    """Кнопка «Скрыть» под длинным составом — удаляет это сообщение."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="← К выбору", callback_data=CardCb(action="hide", index=index))
     return kb.as_markup()
 
 
@@ -126,13 +142,23 @@ def delivery_choice() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def my_order(order: Order) -> InlineKeyboardMarkup | None:
-    """Кнопка «Отменить» — только у принятых заказов."""
-    if order.status != OrderStatus.ACCEPTED:
-        return None
+def my_order(order: Order, *, editable: bool, issue_open: bool, chef_url: str | None) -> InlineKeyboardMarkup | None:
+    """
+    Кнопки под заказом клиента:
+    ✏️ Изменить (первые минуты), ❌ Отменить, ➕ Дозаказать (пока лавка открыта),
+    ✉️ Написать шефу.
+    """
     kb = InlineKeyboardBuilder()
-    kb.button(text="❌ Отменить заказ", callback_data=MyOrderCb(action="cancel", order_id=order.id))
-    return kb.as_markup()
+    if editable:
+        kb.button(text="✏️ Изменить", callback_data=MyOrderCb(action="edit", order_id=order.id))
+    if order.status == OrderStatus.ACCEPTED:
+        kb.button(text="❌ Отменить", callback_data=MyOrderCb(action="cancel", order_id=order.id))
+    if issue_open and order.status != OrderStatus.CANCELLED:
+        kb.button(text="➕ Дозаказать", callback_data=MyOrderCb(action="more", order_id=order.id))
+    if chef_url:
+        kb.button(text=texts.BTN_WRITE_CHEF, url=chef_url)
+    kb.adjust(2, 2)
+    return kb.as_markup() if kb.buttons else None
 
 
 def confirm_cancel(order_id: int) -> InlineKeyboardMarkup:
@@ -169,7 +195,8 @@ def admin_home() -> InlineKeyboardMarkup:
     kb.button(text="⚙️ Настройки", callback_data=AdmCb(section="settings"))
     kb.button(text="👥 Админы", callback_data=AdmCb(section="admins"))
     kb.button(text="🔔 Мои уведомления", callback_data=AdmCb(section="notify"))
-    kb.adjust(2, 2, 1)
+    kb.button(text="🧭 Мастер настройки", callback_data=SetupCb(action="start"))
+    kb.adjust(2, 2, 1, 1)
     return kb.as_markup()
 
 
@@ -201,6 +228,7 @@ def dish(d: Dish) -> InlineKeyboardMarkup:
         ("emoji", "Эмодзи"),
         ("description", "Описание"),
         ("portion", "Порция"),
+        ("composition", "Состав"),
         ("price_cents", "Цена"),
         ("photo_file_id", "Фото"),
     ]:
@@ -210,7 +238,7 @@ def dish(d: Dish) -> InlineKeyboardMarkup:
     else:
         kb.button(text="🗄 В архив", callback_data=DishCb(action="archive", dish_id=d.id))
     kb.button(text="← Каталог", callback_data=AdmCb(section="catalog"))
-    kb.adjust(2, 2, 2, 1, 1)
+    kb.adjust(2, 2, 2, 1, 1, 1)
     return kb.as_markup()
 
 
@@ -271,8 +299,9 @@ def issue(i: Issue) -> InlineKeyboardMarkup:
         add("🔒 Закрыть приём", IssueCb(action="close", issue_id=iid))
         sizes.append(1)
     if i.status == IssueStatus.CLOSED:
+        add("📣 Объявить выдачу", IssueCb(action="announce", issue_id=iid))
         add("✅ Выпуск развезён", IssueCb(action="finish", issue_id=iid))
-        sizes.append(1)
+        sizes += [1, 1]
     add("← Выпуски", AdmCb(section="issues"))
     sizes.append(1)
     kb.adjust(*sizes)
@@ -298,6 +327,7 @@ def item(it: IssueItem, can_remove: bool) -> InlineKeyboardMarkup:
         ("price_cents", "Цена"),
         ("portion", "Порция"),
         ("description", "Описание"),
+        ("composition", "Состав"),
         ("name", "Название"),
         ("emoji", "Эмодзи"),
         ("photo_file_id", "Фото"),
@@ -309,7 +339,7 @@ def item(it: IssueItem, can_remove: bool) -> InlineKeyboardMarkup:
         kb.button(text="⛔ Снять с продажи", callback_data=ItemCb(action="off", item_id=it.id))
     else:
         kb.button(text="✅ Вернуть в продажу", callback_data=ItemCb(action="on", item_id=it.id))
-    sizes = [2, 2, 2, 2, 1]
+    sizes = [2, 2, 2, 1, 2, 1]
     if can_remove:
         kb.button(text="🗑 Убрать из выпуска", callback_data=ItemCb(action="remove", item_id=it.id))
         sizes.append(1)
@@ -338,7 +368,7 @@ def confirm(text: str, cb, back_cb) -> InlineKeyboardMarkup:
 def orders_list(issue_id: int, orders: list[Order]) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     for o in orders:
-        icon = texts.ORDER_STATUS_LABEL[o.status].split()[0]
+        icon = texts.order_status_for_admin(o).split()[0]
         kb.button(text=f"{icon} №{o.id} {o.name} · {format_price(o.total_cents)}", callback_data=AOrderCb(action="view", order_id=o.id))
     kb.button(text="← Выпуск", callback_data=IssueCb(action="view", issue_id=issue_id))
     kb.adjust(1)
@@ -388,6 +418,7 @@ def leftovers(items: list[IssueItem], qty: dict[int, int]) -> InlineKeyboardMark
 
 def settings(pickup_enabled: bool) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
+    kb.button(text="✏️ Контакт для клиентов", callback_data=FieldCb(entity="setting", field="chef_contact"))
     kb.button(text=f"Самовывоз: {'включён ✅' if pickup_enabled else 'выключен ⛔'}", callback_data=SetCb(action="pickup_toggle"))
     kb.button(text="✏️ Адрес самовывоза", callback_data=FieldCb(entity="setting", field="pickup_address"))
     kb.button(text="✏️ Шапка поста о заказе", callback_data=FieldCb(entity="setting", field="order_post_header"))
@@ -423,3 +454,32 @@ def skip_field(entity: str, obj_id: int, field: str) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="🧹 Очистить", callback_data=FieldCb(entity=entity, obj_id=obj_id, field=field, clear=True))
     return kb.as_markup()
+
+
+def preview_actions(issue: Issue) -> InlineKeyboardMarkup:
+    """Кнопки под предпросмотром — чтобы не листать вверх к экрану выпуска."""
+    kb = InlineKeyboardBuilder()
+    if issue.status == IssueStatus.DRAFT:
+        kb.button(text="🚀 Опубликовать", callback_data=IssueCb(action="publish", issue_id=issue.id))
+    kb.button(text="✏️ Вернуться к выпуску", callback_data=IssueCb(action="view", issue_id=issue.id))
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def skip_header(issue_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Пропустить", callback_data=IssueCb(action="view", issue_id=issue_id))
+    return kb.as_markup()
+
+
+def setup_buttons(*buttons: tuple[str, object]) -> InlineKeyboardMarkup:
+    """Кнопки мастера настройки: список (текст, callback_data), по одной в ряд."""
+    kb = InlineKeyboardBuilder()
+    for text, cb in buttons:
+        kb.button(text=text, callback_data=cb)
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def setup_start() -> InlineKeyboardMarkup:
+    return setup_buttons(("▶️ Начать настройку", SetupCb(action="step", value="group")), ("Позже", SetupCb(action="later")))

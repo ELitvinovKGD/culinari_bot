@@ -14,7 +14,10 @@
 
 import html
 import re
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
+from culinary_bot.config import settings
 from culinary_bot.db.models import CartItem, DeliveryType, Issue, IssueItem, IssueStatus, Order, OrderStatus
 from culinary_bot.services.money import format_price
 from culinary_bot.services.orders import CustomerSummary
@@ -35,6 +38,25 @@ def visible_length(html_text: str) -> int:
     return len(html.unescape(without_tags))
 
 
+def local_time(moment: datetime) -> str:
+    """
+    Время из базы (UTC) → «25.11, 18:14» в часовом поясе лавки (TIMEZONE в .env).
+    """
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)  # SQLite в тестах хранит без пояса
+    return moment.astimezone(ZoneInfo(settings.timezone)).strftime("%d.%m, %H:%M")
+
+
+def order_label(order: Order) -> str:
+    """
+    Как клиент видит свой заказ: «заказ от 25.11, 18:14».
+
+    Номер заказа клиенту не показываем (решение от 25.11): «№1» или «1-1»
+    подсказывает, как мало заказов. Номер видит только шеф.
+    """
+    return f"заказ от {local_time(order.created_at)}"
+
+
 # ---------------------------------------------------------------------------
 # Общие фразы
 # ---------------------------------------------------------------------------
@@ -42,6 +64,8 @@ def visible_length(html_text: str) -> int:
 BTN_MENU = "🍽 Меню"
 BTN_MY_ORDERS = "🧾 Мои заказы"
 BTN_ADMIN = "⚙️ Админка"
+BTN_WRITE_CHEF = "✉️ Написать шефу"
+NO_CHEF_CONTACT = "Шеф пока не указал контакт. Напишите ему в группе."
 
 WELCOME = "Привет! Здесь можно заказать блюда из «Тайной лавки шефа».\nНажмите «🍽 Меню», чтобы посмотреть текущий выпуск."
 NO_OPEN_ISSUE = "Шеф ещё не открыл лавку. Новый выпуск появится в группе."
@@ -60,7 +84,11 @@ PRIVACY_NOTICE = (
 ASK_NAME = "Как вас зовут?"
 ASK_PHONE = "Ваш телефон для связи?\nНапример: +995 555 123 456"
 ASK_DELIVERY = "Доставка или самовывоз?"
-ASK_ADDRESS = "Адрес доставки?\nУлица, дом, подъезд, этаж — всё, что поможет найти."
+ASK_ADDRESS = (
+    "Адрес доставки? Напишите текстом: улица, дом, подъезд, этаж.\n\n"
+    "Или отправьте точку на карте: 📎 → Геопозиция → выберите место."
+)
+ASK_ADDRESS_NOTE = "Точка получена 📍\nУточните подъезд, этаж или ориентир — или пропустите."
 ASK_COMMENT = "Комментарий к заказу, если нужен.\nНапример: позвонить за час, пожелание по времени."
 DELIVERY_LABEL = {DeliveryType.DELIVERY: "доставка", DeliveryType.PICKUP: "самовывоз"}
 
@@ -133,8 +161,17 @@ def menu_post_text(issue: Issue, order_link: str | None = None) -> str:
 
 
 def card_text(item: IssueItem, index: int, total: int) -> str:
-    """Карточка блюда в карусели клиента."""
+    """Карточка блюда в карусели клиента (состав — по кнопке «📋 Состав»)."""
     return f"{item_block(item)}\n\n<i>Блюдо {index + 1} из {total}</i>"
+
+
+# Всплывающее окно Telegram (show_alert) вмещает максимум 200 символов.
+ALERT_LIMIT = 200
+
+
+def composition_text(item: IssueItem) -> str:
+    """Текст «📋 Состав» — простой текст без HTML (во всплывающем окне теги не работают)."""
+    return f"Состав: {item.composition}"
 
 
 def cart_button(count: int, total_cents: int) -> str:
@@ -163,19 +200,22 @@ def summary_text(cart: list[CartItem], total_cents: int) -> str:
     return f"<b>Ваш заказ</b>\n\n{cart_lines(cart)}\n\n<b>Итого: {format_price(total_cents)}</b>"
 
 
-def contact_text(name: str | None, phone: str | None, delivery_type: str | None, address: str | None) -> str:
+def contact_text(
+    name: str | None, phone: str | None, delivery_type: str | None, address: str | None, has_point: bool = False
+) -> str:
     """Сохранённые данные клиента для вопроса «Всё верно?»."""
     lines = [f"Имя: {esc(name)}", f"Телефон: {esc(phone)}"]
     if delivery_type == DeliveryType.PICKUP:
         lines.append("Получение: самовывоз")
     else:
         lines.append("Получение: доставка")
-        lines.append(f"Адрес: {esc(address)}")
+        point = "📍 точка на карте" if has_point else ""
+        lines.append(f"Адрес: {' · '.join(x for x in (point, esc(address)) if x)}")
     return "\n".join(lines)
 
 
-def saved_data_question(name, phone, delivery_type, address) -> str:
-    return f"<b>Ваши данные</b>\n\n{contact_text(name, phone, delivery_type, address)}\n\nВсё верно?"
+def saved_data_question(name, phone, delivery_type, address, has_point: bool = False) -> str:
+    return f"<b>Ваши данные</b>\n\n{contact_text(name, phone, delivery_type, address, has_point)}\n\nВсё верно?"
 
 
 def order_lines(order: Order) -> str:
@@ -190,19 +230,23 @@ def order_lines(order: Order) -> str:
 def order_accepted(order: Order) -> str:
     """Сообщение клиенту после оформления."""
     return (
-        f"✅ <b>Заказ №{order.id} принят</b>\n\n{order_lines(order)}\n\n"
+        f"✅ <b>Ваш заказ принят</b>\n\n{order_lines(order)}\n\n"
         f"Итого: {format_price(order.total_cents)}\n\n"
-        "Дату доставки шеф сообщит после закрытия приёма.\n"
-        "Отменить или посмотреть заказ — «🧾 Мои заказы»."
+        f"Изменить заказ можно в течение {settings.order_edit_minutes} минут.\n"
+        "Когда будет готово, шеф сообщит здесь."
     )
 
 
 def order_for_customer(order: Order) -> str:
     """Заказ в разделе «Мои заказы»."""
     return (
-        f"<b>№{order.id}</b> · {esc(order.issue.title)} · {ORDER_STATUS_LABEL[order.status]}\n"
+        f"<b>{order_label(order).capitalize()}</b> · {esc(order.issue.title)} · {ORDER_STATUS_LABEL[order.status]}\n"
         f"{order_lines(order)}\nСумма: {format_price(order.total_cents)}"
     )
+
+
+def order_reverted() -> str:
+    return "Заказ возвращён в корзину ✏️ Поправьте и оформите снова — данные вводить не придётся."
 
 
 # ---------------------------------------------------------------------------
@@ -210,12 +254,19 @@ def order_for_customer(order: Order) -> str:
 # ---------------------------------------------------------------------------
 
 
+def order_status_for_admin(order: Order) -> str:
+    """Статус для шефа; у заказа в окне правки — «⏳ клиент ещё может изменить»."""
+    if order.status == OrderStatus.ACCEPTED and order.confirmed_at is None:
+        return "⏳ оформлен, клиент ещё может изменить"
+    return ORDER_STATUS_LABEL[order.status]
+
+
 def order_for_admin(order: Order, title: str = "Заказ") -> str:
     """Карточка заказа для админа: состав, сумма, контакты."""
     username = f" (@{esc(order.username)})" if order.username else ""
     lines = [
         f"<b>{title} №{order.id}</b> — {esc(order.name)}{username}",
-        f"Статус: {ORDER_STATUS_LABEL[order.status]}",
+        f"Статус: {order_status_for_admin(order)} · от {local_time(order.created_at)}",
         "",
         order_lines(order),
         "",
@@ -223,14 +274,26 @@ def order_for_admin(order: Order, title: str = "Заказ") -> str:
         f"Телефон: {esc(order.phone)}",
     ]
     if order.delivery_type == DeliveryType.DELIVERY:
-        lines.append(f"Адрес: {esc(order.address)}")
+        if order.address:
+            lines.append(f"Адрес: {esc(order.address)}")
+        if order.map_url:
+            lines.append(f'📍 <a href="{order.map_url}">Точка на карте</a>')
     if order.comment:
         lines.append(f"Комментарий: {esc(order.comment)}")
     return "\n".join(lines)
 
 
-def new_order_notification(order: Order) -> str:
-    return "🆕 " + order_for_admin(order, "Новый заказ")
+def new_order_notification(order: Order, *, reorder: bool, excel_outdated: bool) -> str:
+    """
+    Уведомление шефу о сформированном заказе.
+
+    reorder — у клиента уже есть заказ в этом выпуске (дозаказ);
+    excel_outdated — таблицу по выпуску уже скачивали, она устарела.
+    """
+    text = "🆕 " + order_for_admin(order, "Дозаказ" if reorder else "Новый заказ")
+    if excel_outdated:
+        text += "\n\n⚠️ Таблица изменилась — пересоберите «📊 Excel», если уже распечатали."
+    return text
 
 
 def cancel_notification(order: Order, by: str) -> str:
@@ -238,9 +301,18 @@ def cancel_notification(order: Order, by: str) -> str:
     return f"❌ <b>Заказ №{order.id} отменён {who}</b>\n\n{order_for_admin(order)}"
 
 
+def shorten(text: str, limit: int = 120) -> str:
+    """Обрезать длинный текст для экрана админки: «Last call, хомячки мои! Лечу…»."""
+    text = " ".join(text.split())  # переносы строк → пробелы
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
 def issue_for_admin(issue: Issue, orders_count: int, total_cents: int) -> str:
     """Экран выпуска в админке."""
     lines = [f"<b>{esc(issue.title)}</b>", ISSUE_STATUS_LABEL[issue.status], ""]
+    lines.append(f"<b>Шапка:</b> {esc(shorten(issue.header)) if issue.header else '— не заполнена'}")
+    lines.append(f"<b>После списка:</b> {esc(shorten(issue.footer)) if issue.footer else '—'}")
+    lines.append("")
     if not issue.items:
         lines.append("Блюд пока нет — нажмите «➕ Блюдо».")
     for item in issue.items:
@@ -267,12 +339,20 @@ def order_group_post(order: Order, header: str, footer: str) -> str:
     return f"{esc(header)}\n\n" + "\n".join(lines) + f"\n\n{esc(footer)}"
 
 
-def closing_message(issue: Issue, summary: CustomerSummary, pickup_address: str | None) -> str:
-    """Сообщение клиенту при закрытии приёма: текст шефа + его позиции + общий итог."""
-    lines = [esc(issue.closing_text), "", f"<b>Ваш заказ в «{esc(issue.title)}»:</b>"]
+def issue_closed_message(issue: Issue) -> str:
+    """Автоматическое сообщение клиентам при закрытии приёма."""
+    return (
+        f"Приём заказов в «{esc(issue.title)}» закрыт.\n"
+        "Ваш заказ принят в работу — шеф сообщит здесь, когда будет готово."
+    )
+
+
+def announcement_message(issue: Issue, summary: CustomerSummary, text: str, pickup_address: str | None) -> str:
+    """«📣 Объявить выдачу»: текст шефа + позиции клиента + итог + (самовывоз) адрес."""
+    lines = [esc(text), "", f"<b>Ваш заказ в «{esc(issue.title)}»:</b>"]
     for (name, _portion, price, _extra), qty in summary.lines.items():
         lines.append(f"• {esc(name)} × {qty} — {format_price(price * qty)}")
-    lines.append(f"\n<b>Итого: {format_price(summary.total_cents)}</b>")
+    lines.append(f"\n<b>К оплате: {format_price(summary.total_cents)}</b>")
     if summary.delivery_type == DeliveryType.PICKUP and pickup_address:
         lines.append(f"\nСамовывоз: {esc(pickup_address)}")
     return "\n".join(lines)
@@ -287,18 +367,18 @@ def leftovers_post(lines: list[tuple[str, int]]) -> str:
 def price_changed(item: IssueItem, old_cents: int, order: Order) -> str:
     return (
         f"Шеф изменил цену: <b>{esc(item.name)}</b> {format_price(old_cents)} → {format_price(item.price_cents)}.\n"
-        f"Ваш заказ №{order.id}, новый итог: <b>{format_price(order.total_cents)}</b>.\n"
+        f"Ваш {order_label(order)}, новый итог: <b>{format_price(order.total_cents)}</b>.\n"
         "Если не подходит — заказ можно отменить."
     )
 
 
 def item_changed(item: IssueItem, order: Order) -> str:
-    return f"Шеф обновил блюдо в вашем заказе №{order.id}:\n\n{item_block(item)}"
+    return f"Шеф обновил блюдо в вашем заказе ({order_label(order)}):\n\n{item_block(item)}"
 
 
 def item_removed(item: IssueItem, order: Order) -> str:
     return (
-        f"⚠️ Блюдо <b>{esc(item.name)}</b> из вашего заказа №{order.id} закончилось.\n"
+        f"⚠️ Блюдо <b>{esc(item.name)}</b> из вашего заказа ({order_label(order)}) закончилось.\n"
         "Шеф свяжется с вами."
     )
 
@@ -309,10 +389,10 @@ def item_added(item: IssueItem) -> str:
 
 def extra_added(order: Order, name: str, qty: int, price_cents: int) -> str:
     return (
-        f"Шеф добавил в ваш заказ №{order.id}: {esc(name)} × {qty}, {format_price(price_cents * qty)}.\n"
+        f"Шеф добавил в ваш заказ ({order_label(order)}): {esc(name)} × {qty}, {format_price(price_cents * qty)}.\n"
         f"Итого: <b>{format_price(order.total_cents)}</b>"
     )
 
 
 def cancelled_by_admin(order: Order) -> str:
-    return f"Шеф отменил ваш заказ №{order.id}. Если это неожиданно — напишите ему."
+    return f"Шеф отменил ваш {order_label(order)}. Если это неожиданно — напишите ему."

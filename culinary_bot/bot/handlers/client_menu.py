@@ -9,6 +9,7 @@
 """
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -91,6 +92,39 @@ async def get_issue_for_callback(callback: CallbackQuery, session: AsyncSession)
 @router.callback_query(ListCb.filter(F.action == "noop"))
 async def cb_noop(callback: CallbackQuery) -> None:
     """Кнопки-надписи (номер страницы, количество) — просто ничего не делаем."""
+    await callback.answer()
+
+
+@router.callback_query(CardCb.filter(F.action == "comp"))
+async def cb_composition(callback: CallbackQuery, callback_data: CardCb, session: AsyncSession) -> None:
+    """
+    «📋 Состав» — показать состав блюда.
+
+    Короткий — во всплывающем окне (закрыл — снова выбор блюд).
+    Длинный (окно вмещает только 200 символов) — отдельным сообщением
+    с кнопкой «← К выбору», которая это сообщение убирает.
+    """
+    item = await session.get(IssueItem, callback_data.item_id)
+    if item is None or not item.composition:
+        await callback.answer("Состав не указан.", show_alert=True)
+        return
+    text = texts.composition_text(item)
+    if len(text) <= texts.ALERT_LIMIT:
+        await callback.answer(text, show_alert=True)
+        return
+    await callback.message.answer(
+        f"<b>{texts.esc(item.name)}</b>\n\n{texts.esc(text)}", reply_markup=keyboards.hide_message(callback_data.index)
+    )
+    await callback.answer()
+
+
+@router.callback_query(CardCb.filter(F.action == "hide"))
+async def cb_hide(callback: CallbackQuery) -> None:
+    """Убрать сообщение с составом — карточка блюда осталась выше."""
+    try:
+        await callback.message.delete()
+    except TelegramBadRequest:
+        pass
     await callback.answer()
 
 

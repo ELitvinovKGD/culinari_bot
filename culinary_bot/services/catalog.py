@@ -10,7 +10,7 @@ from culinary_bot.services import ServiceError
 
 # Поля карточки, которые можно менять через бота. Если добавишь новое поле
 # в models.Dish и захочешь редактировать его кнопкой — допиши сюда.
-EDITABLE_FIELDS = {"name", "emoji", "description", "portion", "price_cents", "photo_file_id"}
+EDITABLE_FIELDS = {"name", "emoji", "description", "portion", "composition", "price_cents", "photo_file_id"}
 
 
 async def create_dish(
@@ -21,6 +21,7 @@ async def create_dish(
     emoji: str | None = None,
     description: str | None = None,
     portion: str | None = None,
+    composition: str | None = None,
     photo_file_id: str | None = None,
 ) -> Dish:
     """Создать карточку блюда. Возвращает созданный объект с заполненным id."""
@@ -32,6 +33,7 @@ async def create_dish(
         emoji=emoji,
         description=description,
         portion=portion,
+        composition=composition,
         photo_file_id=photo_file_id,
     )
     session.add(dish)

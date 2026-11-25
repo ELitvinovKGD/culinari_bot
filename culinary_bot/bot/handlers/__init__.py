@@ -21,6 +21,7 @@ from culinary_bot.bot.handlers import (
     admin_issues,
     admin_main,
     admin_orders,
+    admin_setup,
     client_checkout,
     client_menu,
     client_orders,
@@ -46,7 +47,7 @@ def build_router() -> Router:
     admin = Router(name="admin")
     admin.message.filter(IsAdmin())
     admin.callback_query.filter(IsAdmin())
-    for module in (admin_main, admin_fields, admin_catalog, admin_issues, admin_orders):
+    for module in (admin_main, admin_setup, admin_fields, admin_catalog, admin_issues, admin_orders):
         admin.include_router(module.router)
     private.include_router(admin)
 

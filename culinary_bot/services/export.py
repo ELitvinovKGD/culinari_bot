@@ -63,6 +63,8 @@ def short_place(summary: CustomerSummary) -> str:
     if summary.delivery_type == DeliveryType.PICKUP:
         return "самовывоз"
     address = summary.address or ""
+    if summary.map_url:
+        address = f"📍 {address}".strip()
     return address if len(address) <= 22 else address[:21] + "…"
 
 
@@ -162,7 +164,7 @@ def _production_sheet(ws: Worksheet, issue: Issue, summaries: list[CustomerSumma
 
 def _delivery_sheet(ws: Worksheet, summaries: list[CustomerSummary]) -> None:
     """Лист «Доставка»: одна строка на клиента — всё, что нужно при развозе."""
-    headers = ["Заказы", "Имя", "Телефон", "Telegram", "Получение", "Адрес", "Позиции", "К оплате, €", "Комментарий"]
+    headers = ["Заказы", "Имя", "Телефон", "Telegram", "Получение", "Адрес", "Карта", "Позиции", "К оплате, €", "Комментарий"]
     ws.append(headers)
     for cell in ws[1]:
         cell.font, cell.fill, cell.alignment = BOLD, GREY, CENTER
@@ -178,18 +180,24 @@ def _delivery_sheet(ws: Worksheet, summaries: list[CustomerSummary]) -> None:
                 f"@{s.username}" if s.username else "",
                 "самовывоз" if s.delivery_type == DeliveryType.PICKUP else "доставка",
                 s.address or "",
+                "📍 открыть" if s.map_url else "",
                 lines,
                 euros(s.total_cents),
                 "\n".join(s.comments),
             ]
         )
+        if s.map_url:
+            # Клетка-ссылка: нажал — открылась точка в Google Maps.
+            map_cell = ws.cell(row=ws.max_row, column=7)
+            map_cell.hyperlink = s.map_url
+            map_cell.font = Font(color="0563C1", underline="single")
     for r in ws.iter_rows(min_row=2):
         for cell in r:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
     for r in ws.iter_rows():
         for cell in r:
             cell.border = BORDER
-    for col, width in enumerate([10, 16, 16, 14, 11, 30, 30, 9, 30], start=1):
+    for col, width in enumerate([10, 16, 16, 14, 11, 30, 10, 30, 9, 30], start=1):
         ws.column_dimensions[get_column_letter(col)].width = width
     _print_setup(ws)
 

@@ -11,10 +11,11 @@ from aiogram.types import BufferedInputFile, CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from culinary_bot import texts
-from culinary_bot.bot import keyboards, publisher
+from culinary_bot.bot import jobs, keyboards, publisher
 from culinary_bot.bot.callbacks import IssueCb, ItemCb, LeftCb
+from culinary_bot.bot.handlers import client_orders
 from culinary_bot.bot.ui import replace_message
-from culinary_bot.db.models import Issue, IssueItem, IssueStatus, OrderStatus
+from culinary_bot.db.models import DeliveryType, Issue, IssueItem, IssueStatus, OrderStatus, utcnow
 from culinary_bot.services import ServiceError
 from culinary_bot.services import catalog as catalog_service
 from culinary_bot.services import export as export_service
@@ -30,7 +31,9 @@ class IssueInput(StatesGroup):
     """Текстовые ответы шефа в разделе выпусков."""
 
     title = State()  # название нового выпуска
-    closing_text = State()  # текст для клиентов при закрытии приёма
+    header = State()  # шапка — спрашиваем сразу после названия
+    delivery_text = State()  # объявление выдачи для клиентов с доставкой
+    pickup_text = State()  # объявление выдачи для клиентов с самовывозом
 
 
 class Leftovers(StatesGroup):
@@ -55,7 +58,8 @@ async def send_item(message: Message, session: AsyncSession, item: IssueItem) ->
     """Отправить позицию выпуска (как её увидит клиент) с кнопками правки."""
     can_remove = not await issue_service.item_has_orders(session, item)
     status = "" if item.is_active else "\n\n⛔ <i>Снято с продажи</i>"
-    caption = texts.item_block(item) + status
+    composition = f"\n\n<i>Состав: {texts.esc(item.composition)}</i>" if item.composition else ""
+    caption = texts.item_block(item) + composition + status
     kb = keyboards.item(item, can_remove)
     if item.photo_file_id:
         await message.answer_photo(item.photo_file_id, caption=caption, reply_markup=kb)
@@ -118,7 +122,27 @@ async def on_title(message: Message, state: FSMContext, session: AsyncSession) -
     except ServiceError as error:
         await message.answer(str(error))
         return
-    await message.answer("Черновик создан. Добавьте шапку и блюда, затем — предпросмотр и публикация.")
+    # Шапку спрашиваем сразу: шеф придумал название — тут же пишет шапку
+    # (решение по итогам тестов). Текст после списка — потом, отдельной кнопкой.
+    await state.set_state(IssueInput.header)
+    await state.update_data(issue_id=issue.id)
+    await message.answer(
+        "Черновик создан ✅\n\nТеперь шапка поста — текст перед списком блюд.\n"
+        "Например: <i>Last call, хомячки мои! Лечу в Цогимар за рыбой…</i>",
+        reply_markup=keyboards.skip_header(issue.id),
+    )
+
+
+@router.message(IssueInput.header, F.text)
+async def on_header(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    """Шапка нового выпуска."""
+    data = await state.get_data()
+    await state.clear()
+    issue = await issue_service.get_issue(session, data["issue_id"])
+    if message.text != "/cancel":
+        issue_service.update_issue_field(issue, "header", message.text.strip())
+        await session.flush()
+    await message.answer("Дальше — добавьте блюда: «➕ Блюдо».")
     await send_issue(message, session, issue)
 
 
@@ -249,7 +273,7 @@ async def apply_price(message: Message, session: AsyncSession, bot: Bot, item: I
     await session.flush()
     for order in changed:
         await publisher.send_safe(
-            bot, order.customer.tg_id, texts.price_changed(item, old, order), keyboards.my_order(order)
+            bot, order.customer.tg_id, texts.price_changed(item, old, order), await client_orders.order_keyboard(session, order)
         )
     note = f" Уведомлено заказов: {len(changed)}." if changed else ""
     extra = "\nНе забудьте «🔄 Обновить пост в группе»." if item.issue.status == IssueStatus.OPEN else ""
@@ -273,6 +297,8 @@ async def cb_preview(callback: CallbackQuery, callback_data: IssueCb, session: A
         return
     await callback.message.answer("👁 Так пост будет выглядеть в группе:")
     await publisher.send_menu_post(bot, callback.message.chat.id, issue, bot_username)
+    # Кнопки сразу под предпросмотром — не нужно листать вверх к экрану выпуска.
+    await callback.message.answer("Всё верно?", reply_markup=keyboards.preview_actions(issue))
     await callback.answer()
 
 
@@ -385,6 +411,9 @@ async def cb_excel(callback: CallbackQuery, callback_data: IssueCb, session: Asy
         return
     orders = await order_service.issue_orders(session, issue)
     content = export_service.build_issue_workbook(issue, orders)
+    # Запоминаем время выгрузки: если потом придёт заказ, шеф получит
+    # «⚠️ Таблица изменилась — пересоберите, если распечатали».
+    issue.excel_exported_at = utcnow()
     # BufferedInputFile — файл из памяти (байты) с именем, под которым его увидит шеф.
     file = BufferedInputFile(content, filename=f"vypusk_{issue.id}.xlsx")
     await callback.message.answer_document(file, caption=f"📊 {texts.esc(issue.title)}: производство и доставка")
@@ -397,68 +426,180 @@ async def cb_excel(callback: CallbackQuery, callback_data: IssueCb, session: Asy
 
 
 @router.callback_query(IssueCb.filter(F.action == "close"))
-async def cb_close(callback: CallbackQuery, callback_data: IssueCb, state: FSMContext) -> None:
-    """Попросить текст для клиентов."""
-    await state.set_state(IssueInput.closing_text)
-    await state.update_data(issue_id=callback_data.issue_id)
-    await callback.message.answer(
-        "Напишите сообщение для клиентов этого выпуска, например:\n"
-        "«Всё готово, развожу во вторник после 17:00».\n\n"
-        "Каждый клиент получит его вместе со своим заказом и итогом.\n<i>/cancel — отменить</i>"
-    )
-    await callback.answer()
-
-
-@router.message(IssueInput.closing_text, F.text)
-async def on_closing_text(message: Message, state: FSMContext, session: AsyncSession) -> None:
-    """Текст получен — показать, сколько клиентов получат сообщение, и спросить подтверждение."""
-    if message.text == "/cancel":
-        await state.clear()
-        await message.answer("Отменено.")
+async def cb_close(callback: CallbackQuery, callback_data: IssueCb, session: AsyncSession) -> None:
+    """«🔒 Закрыть приём» — спросить подтверждение."""
+    issue = await load_issue(callback, session, callback_data.issue_id)
+    if not issue:
         return
-    data = await state.get_data()
-    await state.update_data(closing_text=message.text.strip())
-    issue = await issue_service.get_issue(session, data["issue_id"])
-    orders = await order_service.issue_orders(session, issue, include_cancelled=False)
-    customers = len(order_service.summarize_by_customer(orders))
-    await message.answer(
-        f"Закрыть приём в «{texts.esc(issue.title)}»? Сообщение получат клиентов: {customers}.",
+    await callback.message.answer(
+        f"Закрыть приём заказов в «{texts.esc(issue.title)}»?\n\n"
+        "Клиенты получат короткое сообщение «приём закрыт, заказ в работе».\n"
+        "Когда всё будет готово — нажмите «📣 Объявить выдачу».",
         reply_markup=keyboards.confirm(
             "🔒 Да, закрыть", IssueCb(action="close_yes", issue_id=issue.id), IssueCb(action="view", issue_id=issue.id)
         ),
     )
+    await callback.answer()
 
 
 @router.callback_query(IssueCb.filter(F.action == "close_yes"))
-async def cb_close_yes(callback: CallbackQuery, callback_data: IssueCb, state: FSMContext, session: AsyncSession, bot: Bot) -> None:
-    """Закрыть приём и разослать клиентам сообщение о доставке (А7)."""
+async def cb_close_yes(callback: CallbackQuery, callback_data: IssueCb, session: AsyncSession, bot: Bot) -> None:
+    """
+    Закрыть приём (А7, решение от 25.11 — без текста шефа).
+
+    Заказы, у которых ещё идёт окно правки, подтверждаем сразу: приём закрыт,
+    менять уже нечего, а шеф должен увидеть их в списке и таблице.
+    """
+    issue = await load_issue(callback, session, callback_data.issue_id)
+    if not issue:
+        return
+    try:
+        await issue_service.close_issue(session, issue)
+    except ServiceError as error:
+        await callback.answer(str(error), show_alert=True)
+        return
+    await callback.message.edit_reply_markup(reply_markup=None)
+    for order in await order_service.unconfirmed_issue_orders(session, issue):
+        await jobs.finalize_order(bot, session, order)
+
+    orders = await order_service.issue_orders(session, issue, include_cancelled=False)
+    customer_tg_ids = {o.customer.tg_id for o in orders}
+    for tg_id in customer_tg_ids:
+        await publisher.send_safe(bot, tg_id, texts.issue_closed_message(issue))
+    await callback.message.answer(
+        f"🔒 Приём закрыт. Клиентов с заказами: {len(customer_tg_ids)}.\n"
+        "Когда всё будет готово — «📣 Объявить выдачу»."
+    )
+    await send_issue(callback.message, session, issue)
+    await callback.answer()
+
+
+# ---------------------------------------------------------------------------
+# Объявление выдачи (решение от 25.11)
+# ---------------------------------------------------------------------------
+
+
+async def announce_plan(session: AsyncSession, issue) -> tuple[list, bool, bool]:
+    """Сводки клиентов и есть ли среди них доставка / самовывоз."""
+    orders = await order_service.issue_orders(session, issue, include_cancelled=False)
+    summaries = order_service.summarize_by_customer(orders)
+    has_delivery = any(s.delivery_type == DeliveryType.DELIVERY for s in summaries)
+    has_pickup = any(s.delivery_type == DeliveryType.PICKUP for s in summaries)
+    return summaries, has_delivery, has_pickup
+
+
+@router.callback_query(IssueCb.filter(F.action == "announce"))
+async def cb_announce(callback: CallbackQuery, callback_data: IssueCb, state: FSMContext, session: AsyncSession) -> None:
+    """
+    «📣 Объявить выдачу»: спросить текст(ы).
+
+    Если есть клиенты и с доставкой, и с самовывозом — два текста по очереди.
+    """
+    issue = await load_issue(callback, session, callback_data.issue_id)
+    if not issue:
+        return
+    summaries, has_delivery, has_pickup = await announce_plan(session, issue)
+    if not summaries:
+        await callback.answer("В выпуске нет действующих заказов.", show_alert=True)
+        return
+    await state.update_data(issue_id=issue.id, delivery_text=None, pickup_text=None)
+    if has_delivery:
+        await state.set_state(IssueInput.delivery_text)
+        await callback.message.answer(
+            "Текст для клиентов <b>с доставкой</b>.\nНапример: <i>Всё готово, развожу во вторник после 17:00</i>\n\n"
+            "Каждый получит его вместе со своим заказом и суммой к оплате.\n<i>/cancel — отменить</i>"
+        )
+    else:
+        await ask_pickup_text(callback.message, state, session)
+    await callback.answer()
+
+
+async def ask_pickup_text(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    address = await settings_service.get_value(session, settings_service.PICKUP_ADDRESS)
+    warning = "" if address else "\n\n⚠️ Адрес самовывоза не заполнен (⚙️ Настройки) — клиенты его не увидят."
+    await state.set_state(IssueInput.pickup_text)
+    await message.answer(
+        "Текст для клиентов <b>с самовывозом</b>.\nНапример: <i>Забрать можно в среду с 12 до 18</i>\n"
+        f"Адрес самовывоза бот добавит сам.{warning}\n<i>/cancel — отменить</i>"
+    )
+
+
+@router.message(IssueInput.delivery_text, F.text)
+async def on_delivery_text(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+    await state.update_data(delivery_text=message.text.strip())
     data = await state.get_data()
-    closing_text = data.get("closing_text")
-    if not closing_text or data.get("issue_id") != callback_data.issue_id:
-        await callback.answer("Сначала нажмите «🔒 Закрыть приём» и напишите текст.", show_alert=True)
+    issue = await issue_service.get_issue(session, data["issue_id"])
+    _, _, has_pickup = await announce_plan(session, issue)
+    if has_pickup:
+        await ask_pickup_text(message, state, session)
+    else:
+        await confirm_announce(message, state, session)
+
+
+@router.message(IssueInput.pickup_text, F.text)
+async def on_pickup_text(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+    await state.update_data(pickup_text=message.text.strip())
+    await confirm_announce(message, state, session)
+
+
+async def confirm_announce(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    """Показать, сколько клиентов получат объявление, и спросить подтверждение."""
+    data = await state.get_data()
+    issue = await issue_service.get_issue(session, data["issue_id"])
+    summaries, _, _ = await announce_plan(session, issue)
+    await message.answer(
+        f"Отправить объявление клиентам «{texts.esc(issue.title)}»? Получат: {len(summaries)}.",
+        reply_markup=keyboards.confirm(
+            "📣 Да, отправить", IssueCb(action="announce_yes", issue_id=issue.id), IssueCb(action="view", issue_id=issue.id)
+        ),
+    )
+
+
+@router.callback_query(IssueCb.filter(F.action == "announce_yes"))
+async def cb_announce_yes(
+    callback: CallbackQuery, callback_data: IssueCb, state: FSMContext, session: AsyncSession, bot: Bot
+) -> None:
+    """Разослать объявление выдачи каждому клиенту выпуска."""
+    data = await state.get_data()
+    if data.get("issue_id") != callback_data.issue_id or not (data.get("delivery_text") or data.get("pickup_text")):
+        await callback.answer("Сначала нажмите «📣 Объявить выдачу» и напишите текст.", show_alert=True)
         return
     await state.clear()
     issue = await load_issue(callback, session, callback_data.issue_id)
     if not issue:
         return
     try:
-        await issue_service.close_issue(session, issue, closing_text)
+        issue_service.announce(issue, data.get("delivery_text"), data.get("pickup_text"))
     except ServiceError as error:
         await callback.answer(str(error), show_alert=True)
         return
     await callback.message.edit_reply_markup(reply_markup=None)
 
     pickup_address = await settings_service.get_value(session, settings_service.PICKUP_ADDRESS)
+    chef_url = await settings_service.get_chef_contact_url(session)
+    kb = keyboards.url_button(texts.BTN_WRITE_CHEF, chef_url) if chef_url else None
     orders = await order_service.issue_orders(session, issue, include_cancelled=False)
-    # tg_id клиентов: у заказа есть customer, у сводки — только customer_id.
     tg_ids = {o.customer_id: o.customer.tg_id for o in orders}
-    failed: list[str] = []
     summaries = order_service.summarize_by_customer(orders)
+    failed: list[str] = []
     for summary in summaries:
-        ok = await publisher.send_safe(bot, tg_ids[summary.customer_id], texts.closing_message(issue, summary, pickup_address))
+        text = issue.pickup_text if summary.delivery_type == DeliveryType.PICKUP else issue.closing_text
+        # Если для этой группы текста нет (например, самовывоз появился позже) — берём другой.
+        text = text or issue.closing_text or issue.pickup_text
+        ok = await publisher.send_safe(
+            bot, tg_ids[summary.customer_id], texts.announcement_message(issue, summary, text, pickup_address), kb
+        )
         if not ok:
             failed.append(f"{texts.esc(summary.name)} {texts.esc(summary.phone)}")
-    report = f"🔒 Приём закрыт. Сообщение отправлено: {len(summaries) - len(failed)} из {len(summaries)}."
+    report = f"📣 Объявление отправлено: {len(summaries) - len(failed)} из {len(summaries)}."
     if failed:
         report += "\n\nНе доставлено (бот заблокирован) — свяжитесь вручную:\n" + "\n".join(failed)
     await callback.message.answer(report)
@@ -546,10 +687,15 @@ async def cb_leftovers_edit(callback: CallbackQuery, callback_data: LeftCb, stat
         if chat_id is None:
             await callback.answer("Группа не подключена.", show_alert=True)
             return
-        # Кнопка «Написать шефу» ведёт в личку того, кто публикует.
-        # Нет @username — кнопку не ставим, в тексте и так написано «пишите шефу».
-        username = callback.from_user.username
-        kb = keyboards.url_button("✉️ Написать шефу", f"https://t.me/{username}") if username else None
+        # Кнопка ведёт на «Контакт для клиентов» из настроек — к шефу,
+        # кто бы ни публиковал пост (раньше вела к публикующему — исправлено).
+        chef_url = await settings_service.get_chef_contact_url(session)
+        if chef_url is None:
+            await callback.answer(
+                "Сначала укажите контакт для клиентов: ⚙️ Настройки → ✏️ Контакт для клиентов.", show_alert=True
+            )
+            return
+        kb = keyboards.url_button(texts.BTN_WRITE_CHEF, chef_url)
         try:
             await bot.send_message(chat_id, texts.leftovers_post(lines), reply_markup=kb)
         except TelegramAPIError as error:

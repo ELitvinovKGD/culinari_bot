@@ -3,14 +3,16 @@
 """
 
 from dataclasses import dataclass, field
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from culinary_bot.db.models import (
+    CartItem,
     Customer,
     Issue,
+    IssueItem,
     IssueStatus,
     Order,
     OrderItem,
@@ -57,6 +59,8 @@ async def place_order(
         username=customer.username,
         delivery_type=customer.delivery_type,
         address=customer.address,
+        latitude=customer.latitude,
+        longitude=customer.longitude,
         comment=(comment or "").strip() or None,
         items=[
             OrderItem(
@@ -96,6 +100,102 @@ async def cancel_order(session: AsyncSession, order: Order, *, by: str) -> None:
     order.status = OrderStatus.CANCELLED
     order.cancelled_at = utcnow()
     order.cancelled_by = by
+
+
+# ---------------------------------------------------------------------------
+# Окно правки: первые N минут после оформления (решение от 25.11)
+#
+# Пока окно открыто (confirmed_at пустой), клиент может нажать «✏️ Изменить»,
+# а шеф и группа о заказе ещё не знают. Когда окно закрылось, фоновая задача
+# (bot/jobs.py) «подтверждает» заказ: ставит confirmed_at, публикует пост
+# и уведомляет шефа.
+# ---------------------------------------------------------------------------
+
+
+def _aware(moment: datetime) -> datetime:
+    """SQLite в тестах отдаёт время без часового пояса — считаем его UTC."""
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
+def edit_deadline(order: Order, minutes: int) -> datetime:
+    """До какого момента заказ можно изменить."""
+    return _aware(order.created_at) + timedelta(minutes=minutes)
+
+
+def is_editable(order: Order, minutes: int) -> bool:
+    """Можно ли ещё нажать «✏️ Изменить»: окно не истекло, заказ не подтверждён, лавка открыта."""
+    return (
+        order.status == OrderStatus.ACCEPTED
+        and order.confirmed_at is None
+        and order.issue.status == IssueStatus.OPEN
+        and utcnow() < edit_deadline(order, minutes)
+    )
+
+
+async def revert_to_cart(session: AsyncSession, order: Order, minutes: int) -> None:
+    """
+    «✏️ Изменить»: вернуть позиции заказа в корзину и удалить заказ.
+
+    Заказ удаляем совсем, а не отменяем: о нём ещё никто не знает (ни шеф,
+    ни группа), и «отменённый» заказ в списке шефа только сбивал бы с толку.
+    Если в корзине уже что-то лежит — количества складываются.
+    """
+    if not is_editable(order, minutes):
+        raise ServiceError("Время на изменение заказа вышло. Можно отменить заказ или дозаказать.")
+    for item in order.items:
+        if item.issue_item_id is None:
+            continue
+        issue_item = await session.get(IssueItem, item.issue_item_id)
+        if issue_item is None or not issue_item.is_active:
+            continue  # блюдо успели снять с продажи — в корзину не вернётся
+        existing = await session.scalar(
+            select(CartItem).where(CartItem.customer_id == order.customer_id, CartItem.issue_item_id == issue_item.id)
+        )
+        if existing:
+            existing.quantity += item.quantity
+        else:
+            session.add(CartItem(customer_id=order.customer_id, issue_item_id=issue_item.id, quantity=item.quantity))
+    await session.delete(order)
+    await session.flush()
+
+
+async def orders_to_confirm(session: AsyncSession, minutes: int) -> list[Order]:
+    """Заказы, у которых окно правки истекло, а подтверждения ещё не было."""
+    border = utcnow() - timedelta(minutes=minutes)
+    result = await session.scalars(
+        select(Order)
+        .where(Order.confirmed_at.is_(None), Order.status == OrderStatus.ACCEPTED, Order.created_at <= border)
+        .order_by(Order.id)
+    )
+    return list(result)
+
+
+async def unconfirmed_issue_orders(session: AsyncSession, issue: Issue) -> list[Order]:
+    """Неподтверждённые заказы выпуска — их подтверждаем сразу при закрытии приёма."""
+    result = await session.scalars(
+        select(Order)
+        .where(Order.issue_id == issue.id, Order.confirmed_at.is_(None), Order.status == OrderStatus.ACCEPTED)
+        .order_by(Order.id)
+    )
+    return list(result)
+
+
+async def is_reorder(session: AsyncSession, order: Order) -> bool:
+    """Есть ли у клиента в этом выпуске другие действующие заказы, оформленные раньше (дозаказ)."""
+    earlier = await session.scalar(
+        select(Order.id).where(
+            Order.customer_id == order.customer_id,
+            Order.issue_id == order.issue_id,
+            Order.id < order.id,
+            Order.status != OrderStatus.CANCELLED,
+        )
+    )
+    return earlier is not None
+
+
+def mark_confirmed(order: Order) -> None:
+    """Отметить заказ сформированным (окно правки закрыто)."""
+    order.confirmed_at = utcnow()
 
 
 def mark_delivered(order: Order) -> None:
@@ -140,13 +240,7 @@ def can_delete_group_post(order: Order) -> bool:
     """Можно ли ещё удалить пост о заказе в группе (прошло меньше 48 часов)."""
     if order.group_message_id is None or order.group_message_sent_at is None:
         return False
-    sent_at = order.group_message_sent_at
-    # SQLite в тестах возвращает время без часового пояса — считаем его UTC.
-    if sent_at.tzinfo is None:
-        from datetime import timezone
-
-        sent_at = sent_at.replace(tzinfo=timezone.utc)
-    return utcnow() - sent_at < GROUP_POST_DELETE_WINDOW
+    return utcnow() - _aware(order.group_message_sent_at) < GROUP_POST_DELETE_WINDOW
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +296,7 @@ class CustomerSummary:
     username: str | None
     delivery_type: str
     address: str | None
+    map_url: str | None = None
     order_ids: list[int] = field(default_factory=list)
     comments: list[str] = field(default_factory=list)
     # {(название, порция, цена, это_позиция_шефа): количество}
@@ -235,11 +330,13 @@ def summarize_by_customer(orders: list[Order]) -> list[CustomerSummary]:
                 username=order.username,
                 delivery_type=order.delivery_type,
                 address=order.address,
+                map_url=order.map_url,
             )
             summaries[order.customer_id] = summary
         else:
             summary.name, summary.phone, summary.username = order.name, order.phone, order.username
             summary.delivery_type, summary.address = order.delivery_type, order.address
+            summary.map_url = order.map_url
         summary.order_ids.append(order.id)
         if order.comment:
             summary.comments.append(order.comment)

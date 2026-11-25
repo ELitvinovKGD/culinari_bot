@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from culinary_bot import texts
 from culinary_bot.bot import keyboards
 from culinary_bot.bot.callbacks import AdmCb, AdminsCb, SetCb
+from culinary_bot.bot.handlers import admin_setup
 from culinary_bot.bot.publisher import deep_link
 from culinary_bot.bot.ui import replace_message
 from culinary_bot.db.models import Admin
@@ -25,27 +26,43 @@ from culinary_bot.services import settings as settings_service
 
 router = Router(name="admin_main")
 
-HOME_TEXT = "<b>Админка</b>\nЧто будем делать?"
 
 
 @router.message(F.text == texts.BTN_ADMIN)
 @router.message(Command("admin"))
-async def admin_home(message: Message, state: FSMContext) -> None:
-    """Кнопка «⚙️ Админка» или команда /admin."""
+async def admin_home(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    """
+    Кнопка «⚙️ Админка» или команда /admin.
+
+    Главный экран с чек-листом готовности (см. admin_setup.py). Если не
+    настроено вообще ничего — сразу предлагаем мастер настройки.
+    """
     await state.clear()
-    await message.answer(HOME_TEXT, reply_markup=keyboards.admin_home())
+    text, kb = await admin_setup.home_view(session)
+    await message.answer(text, reply_markup=kb)
+    if await admin_setup.is_fresh(session):
+        await message.answer(
+            "🧭 Похоже, лавка ещё не настроена. Пройдём 3 коротких шага?", reply_markup=keyboards.setup_start()
+        )
 
 
 async def settings_text(session: AsyncSession) -> str:
     """Текст экрана настроек с текущими значениями."""
     group = await settings_service.get_group_chat_id(session)
     address = await settings_service.get_value(session, settings_service.PICKUP_ADDRESS)
+    pickup = await settings_service.is_pickup_enabled(session)
+    contact = await settings_service.get_value(session, settings_service.CHEF_CONTACT)
     header = await settings_service.get_value(session, settings_service.ORDER_POST_HEADER)
     footer = await settings_service.get_value(session, settings_service.ORDER_POST_FOOTER)
+    if pickup:
+        address_line = texts.esc(address) if address else "не заполнен ⚠️ — клиенты с самовывозом его не узнают"
+    else:
+        address_line = "— (самовывоз выключен)"
     return (
         "<b>Настройки</b>\n\n"
-        f"Группа: {'подключена ✅' if group else 'не подключена — добавьте бота в группу админом и напишите там /connect'}\n"
-        f"Адрес самовывоза: {texts.esc(address) or '—'}\n\n"
+        f"Группа: {'подключена ✅' if group else 'не подключена ⚠️ — добавьте бота в группу админом и напишите там /connect'}\n"
+        f"Контакт для клиентов: {'@' + texts.esc(contact) if contact else 'не указан ⚠️'}\n"
+        f"Адрес самовывоза: {address_line}\n\n"
         f"<b>Пост о заказе в группе:</b>\n{texts.esc(header)}\n• Блюдо — 2\n{texts.esc(footer)}"
     )
 
@@ -58,7 +75,8 @@ async def cb_section(
     await state.clear()
     section = callback_data.section
     if section == "home":
-        await replace_message(callback, HOME_TEXT, reply_markup=keyboards.admin_home())
+        text, kb = await admin_setup.home_view(session)
+        await replace_message(callback, text, reply_markup=kb)
     elif section == "issues":
         issues = await issue_service.list_active_issues(session)
         await replace_message(callback, "<b>Выпуски</b>", reply_markup=keyboards.issues_list(issues, archive=False))

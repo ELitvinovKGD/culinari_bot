@@ -26,7 +26,10 @@ from aiogram.filters.callback_data import CallbackData
 
 
 class CardCb(CallbackData, prefix="card"):
-    """Карусель карточек: show (перейти к карточке), plus, minus, noop (ничего)."""
+    """
+    Карусель карточек: show (перейти к карточке), plus, minus, noop (ничего),
+    comp (показать состав), hide (закрыть сообщение с длинным составом).
+    """
 
     action: str
     index: int  # номер карточки в карусели (0, 1, 2...)
@@ -50,7 +53,7 @@ class CheckoutCb(CallbackData, prefix="chk"):
 
 
 class MyOrderCb(CallbackData, prefix="my"):
-    """«Мои заказы»: cancel (спросить), cancel_yes (подтвердить)."""
+    """«Мои заказы»: cancel (спросить), cancel_yes (подтвердить), edit (вернуть в корзину), more (дозаказать)."""
 
     action: str
     order_id: int
@@ -90,7 +93,8 @@ class IssueCb(CallbackData, prefix="iss"):
     """
     Выпуск: view, new, add (выбрать блюдо), add_dish (добавить конкретное),
     preview, publish, publish_yes, update_post, orders, excel, close, finish,
-    finish_yes, delete, delete_yes, leftovers, leftovers_from (из уведомления об отмене).
+    finish_yes, delete, delete_yes, leftovers, leftovers_from (из уведомления об отмене),
+    close_yes, announce (объявить выдачу), announce_yes.
     """
 
     action: str
@@ -157,3 +161,13 @@ class LeftCb(CallbackData, prefix="left"):
 
     action: str
     item_id: int = 0
+
+
+class SetupCb(CallbackData, prefix="setup"):
+    """
+    Мастер первой настройки: start, later, group_check, step (перейти к шагу value),
+    pickup_yes, pickup_no, skip.
+    """
+
+    action: str
+    value: str = ""

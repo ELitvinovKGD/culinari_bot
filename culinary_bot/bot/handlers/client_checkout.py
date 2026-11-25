@@ -21,8 +21,9 @@ from aiogram.types import CallbackQuery, Message
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from culinary_bot import texts
-from culinary_bot.bot import keyboards, publisher
+from culinary_bot.bot import keyboards
 from culinary_bot.bot.callbacks import CheckoutCb
+from culinary_bot.bot.handlers import client_orders
 from culinary_bot.db.models import Customer, DeliveryType
 from culinary_bot.services import ServiceError
 from culinary_bot.services import customers as customer_service
@@ -39,7 +40,8 @@ class Checkout(StatesGroup):
     name = State()
     phone = State()
     delivery = State()  # ждём нажатия кнопки «Доставка/Самовывоз»
-    address = State()
+    address = State()  # текст адреса ИЛИ геопозиция
+    address_note = State()  # после геопозиции: подъезд, этаж, ориентир
     comment = State()
 
 
@@ -72,7 +74,9 @@ async def ask_contact_or_saved(message: Message, state: FSMContext, customer: Cu
     """Есть сохранённые данные — спросить «всё верно?», нет — начать ввод с имени."""
     if customer.has_saved_data():
         await message.answer(
-            texts.saved_data_question(customer.name, customer.phone, customer.delivery_type, customer.address),
+            texts.saved_data_question(
+                customer.name, customer.phone, customer.delivery_type, customer.address, customer.latitude is not None
+            ),
             reply_markup=keyboards.saved_data(),
         )
     else:
@@ -155,7 +159,7 @@ async def cb_delivery(
     """Выбран способ получения."""
     await callback.message.edit_reply_markup(reply_markup=None)
     if callback_data.action == "pickup":
-        await state.update_data(delivery_type=DeliveryType.PICKUP, address=None)
+        await state.update_data(delivery_type=DeliveryType.PICKUP, address=None, latitude=None, longitude=None)
         await finish_contact(callback.message, state, customer)
     else:
         await state.update_data(delivery_type=DeliveryType.DELIVERY)
@@ -166,19 +170,47 @@ async def cb_delivery(
 async def ask_address(message: Message, state: FSMContext, customer: Customer) -> None:
     data = await state.get_data()
     await state.set_state(Checkout.address)
-    kb = keyboards.keep_previous(customer.address) if data.get("editing") and customer.address else None
+    has_previous = customer.address or customer.latitude is not None
+    previous = customer.address or "📍 точка на карте"
+    kb = keyboards.keep_previous(previous) if data.get("editing") and has_previous else None
     await message.answer(texts.ASK_ADDRESS, reply_markup=kb)
 
 
 @router.message(Checkout.address, F.text)
 async def on_address(message: Message, state: FSMContext, customer: Customer) -> None:
-    """Пришёл адрес."""
+    """Пришёл адрес текстом."""
     address = message.text.strip()
     if len(address) < 5:
         await message.answer("Адрес слишком короткий — напишите подробнее.")
         return
-    await state.update_data(address=address)
+    await state.update_data(address=address, latitude=None, longitude=None)
     await finish_contact(message, state, customer)
+
+
+@router.message(Checkout.address, F.location)
+async def on_location(message: Message, state: FSMContext) -> None:
+    """
+    Пришла точка на карте (📎 → Геопозиция).
+
+    Координаты точные, но подъезд и этаж по ним не понять — спрашиваем уточнение.
+    """
+    await state.update_data(latitude=message.location.latitude, longitude=message.location.longitude)
+    await state.set_state(Checkout.address_note)
+    await message.answer(texts.ASK_ADDRESS_NOTE, reply_markup=keyboards.single("Пропустить", "skip_note"))
+
+
+@router.message(Checkout.address_note, F.text)
+async def on_address_note(message: Message, state: FSMContext, customer: Customer) -> None:
+    await state.update_data(address=message.text.strip()[:300])
+    await finish_contact(message, state, customer)
+
+
+@router.callback_query(Checkout.address_note, CheckoutCb.filter(F.action == "skip_note"))
+async def cb_skip_note(callback: CallbackQuery, state: FSMContext, customer: Customer) -> None:
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await state.update_data(address=None)
+    await finish_contact(callback.message, state, customer)
+    await callback.answer()
 
 
 @router.callback_query(CheckoutCb.filter(F.action == "keep"))
@@ -197,7 +229,7 @@ async def cb_keep(callback: CallbackQuery, state: FSMContext, session: AsyncSess
         await state.update_data(phone=customer.phone)
         await ask_delivery(callback.message, state, session, customer)
     elif current == Checkout.address.state:
-        await state.update_data(address=customer.address)
+        await state.update_data(address=customer.address, latitude=customer.latitude, longitude=customer.longitude)
         await finish_contact(callback.message, state, customer)
     await callback.answer()
 
@@ -211,6 +243,8 @@ async def finish_contact(message: Message, state: FSMContext, customer: Customer
         phone=data["phone"],
         delivery_type=DeliveryType(data["delivery_type"]),
         address=data.get("address"),
+        latitude=data.get("latitude"),
+        longitude=data.get("longitude"),
     )
     await ask_comment(message, state)
 
@@ -245,11 +279,11 @@ async def place(
     message: Message, state: FSMContext, session: AsyncSession, customer: Customer, bot: Bot, *, comment: str | None
 ) -> None:
     """
-    Создать заказ и разослать уведомления.
+    Создать заказ.
 
-    Порядок: сначала заказ (главное), потом пост в группу и уведомление шефу.
-    Ошибки отправки publisher ловит сам, так что заказ не откатится
-    из-за проблем с группой.
+    Пост в группу и уведомление шефу отправляются НЕ сразу: первые минуты
+    клиент может нажать «✏️ Изменить». Когда окно закроется, всё разошлёт
+    фоновая задача (bot/jobs.py).
     """
     await state.clear()
     issue = await issue_service.get_open_issue(session)
@@ -262,14 +296,15 @@ async def place(
         await message.answer(str(error))
         return
 
-    await message.answer(texts.order_accepted(order))
-    await publisher.publish_order(bot, session, order)
-    await publisher.notify_admins(
-        bot, session, texts.new_order_notification(order), keyboards.new_order_notification(order.id), orders=True
-    )
+    await message.answer(texts.order_accepted(order), reply_markup=await client_orders.order_keyboard(session, order))
 
 
 # Если в середине диалога прислали не текст (стикер, фото) — подсказываем.
-@router.message(StateFilter(Checkout.name, Checkout.phone, Checkout.address, Checkout.comment))
+@router.message(StateFilter(Checkout.name, Checkout.phone, Checkout.address_note, Checkout.comment))
 async def on_non_text(message: Message) -> None:
     await message.answer("Пожалуйста, ответьте текстом.")
+
+
+@router.message(Checkout.address)
+async def on_address_other(message: Message) -> None:
+    await message.answer("Напишите адрес текстом или отправьте точку: 📎 → Геопозиция.")
