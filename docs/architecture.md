@@ -61,6 +61,7 @@ Telegram ──► bot/ (обработчики, кнопки)  ──►  servi
 | `services/settings.py` | Настройки шефа (группа, самовывоз, тексты) |
 | `services/export.py` | Excel |
 | `services/money.py` | Цены: разбор и вывод |
+| `services/geocode.py` | Адрес по точке на карте (OpenStreetMap), необязательная подсказка |
 | `bot/middlewares.py` | Сессия базы и «кто пишет» |
 | `bot/filters.py` | Фильтр `IsAdmin` |
 | `bot/callbacks.py` | Форматы данных инлайн-кнопок |
