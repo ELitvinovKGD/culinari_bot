@@ -10,7 +10,8 @@ Dish (каталог) ──< IssueItem >── Issue (выпуск)
                        │
          CartItem ─────┤
                        ↓
-                   OrderItem >── Order >── Customer
+                   OrderItem >── Order >── Customer ──< Recipient
+                                   └──────────────────────┘ (заказ другому)
 
 Admin, AdminInvite, Setting — отдельно
 ```
@@ -39,6 +40,14 @@ Admin, AdminInvite, Setting — отдельно
 | latitude, longitude | число | Точка на карте, если клиент отправил геопозицию |
 | delivery_type | `delivery` / `pickup` | Способ получения |
 | privacy_accepted | bool | Видел уведомление о данных |
+
+### recipients — получатели клиента (записная книжка)
+
+| Колонка | Смысл |
+|---|---|
+| customer_id | Чей получатель |
+| name, phone, address, latitude, longitude | Кому и куда доставить |
+| is_deleted | Удалён из списка (мягко — на него ссылаются старые заказы) |
 
 ### admins, admin_invites — администраторы
 
@@ -93,6 +102,7 @@ Admin, AdminInvite, Setting — отдельно
 | id | Номер заказа, сквозной |
 | status | `accepted` / `delivered` / `cancelled` |
 | name, phone, username, delivery_type, address, latitude, longitude, comment | Снимок данных клиента |
+| recipient_id, payer | Заказ другому получателю: кому (recipients) и кто платит (`customer` / `recipient`). Для заказа себе — пусто |
 | confirmed_at | Пусто — идёт окно правки (10 мин): клиент может «✏️ Изменить», шеф ещё не знает. Заполнено — заказ сформирован, пост и уведомление отправлены |
 | group_message_id, group_message_sent_at | Пост о заказе в группе (удаляется при отмене в течение 48 ч) |
 | cancelled_by | `customer` / `admin` |

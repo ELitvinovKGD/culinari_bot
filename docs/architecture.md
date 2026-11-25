@@ -57,6 +57,7 @@ Telegram ──► bot/ (обработчики, кнопки)  ──►  servi
 | `services/cart.py` | Корзина |
 | `services/orders.py` | Заказы, отмена, позиции шефа, итоги по клиентам |
 | `services/customers.py` | Клиенты, телефон, удаление данных |
+| `services/recipients.py` | Записная книжка получателей (заказы другим людям) |
 | `services/admins.py` | Админы и приглашения |
 | `services/settings.py` | Настройки шефа (группа, самовывоз, тексты) |
 | `services/export.py` | Excel |
@@ -73,6 +74,7 @@ Telegram ──► bot/ (обработчики, кнопки)  ──►  servi
 | `bot/handlers/client_menu.py` | Карусель, список, «Итого» |
 | `bot/handlers/client_checkout.py` | Ввод данных и создание заказа (FSM) |
 | `bot/handlers/client_orders.py` | «Мои заказы», отмена |
+| `bot/handlers/client_profile.py` | «👤 Мои данные»: свои данные и получатели |
 | `bot/handlers/admin_main.py` | Меню админки, настройки, админы |
 | `bot/handlers/admin_setup.py` | Мастер первой настройки и чек-лист готовности |
 | `bot/handlers/admin_fields.py` | Универсальная правка полей |
