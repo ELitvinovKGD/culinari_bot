@@ -31,7 +31,8 @@ async def test_production_sheet(session, open_issue):
     ws = load_workbook(BytesIO(content))["Производство"]
     rows = {row[1]: row for row in ws.iter_rows(values_only=True)}
 
-    assert ws["E1"].value.startswith("Ева") and ws["F1"].value.startswith("Иван")
+    assert ws["E1"].value.startswith("Ева *")  # у Евы есть комментарий — звёздочка
+    assert ws["F1"].value.startswith("Иван\n")
     assert ws["E1"].comment.text == "без лука"
     # Блюдо, цена, всего порций, Ева, Иван
     assert rows["Гороховый суп 700 г"][2:6] == (10, 2, 2, None)

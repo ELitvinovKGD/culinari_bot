@@ -45,6 +45,10 @@ CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
 # textRotation=90 — текст повёрнут снизу вверх, как имена на бумаге шефа.
 VERTICAL = Alignment(horizontal="center", vertical="bottom", text_rotation=90, wrap_text=True)
+# Клиент с комментарием: жёлтая заливка (на ч/б печати — серая), курсив и звёздочка.
+# Звёздочка видна в любом случае — даже на ч/б принтере без заливки.
+HAS_COMMENT_FILL = PatternFill("solid", fgColor="FFE699")
+HAS_COMMENT_FONT = Font(bold=True, italic=True, underline="single")
 
 FIRST_CLIENT_COL = 5  # колонки: A №, B Блюдо, C Цена, D Всего порций, E... клиенты
 
@@ -82,15 +86,18 @@ def _production_sheet(ws: Worksheet, issue: Issue, summaries: list[CustomerSumma
     last_col = FIRST_CLIENT_COL + len(summaries) - 1
 
     # --- Шапка ---
-    for col, title in enumerate(["№", "Блюдо", "Цена, €", "Всего порций"], start=1):
+    for col, title in enumerate(["№", "Блюдо", "Цена, €", "Всего\nпорций"], start=1):
         cell = ws.cell(row=1, column=col, value=title)
         cell.font, cell.alignment, cell.fill = BOLD, CENTER, GREY
     for offset, s in enumerate(summaries):
-        cell = ws.cell(row=1, column=FIRST_CLIENT_COL + offset, value=f"{s.name}\n{short_place(s)}")
+        star = " *" if s.comments else ""
+        cell = ws.cell(row=1, column=FIRST_CLIENT_COL + offset, value=f"{s.name}{star}\n{short_place(s)}")
         cell.font, cell.alignment, cell.fill = BOLD, VERTICAL, GREY
         if s.comments:
-            # Комментарий клиента — всплывающая заметка на его имени
-            # (на печати не видна; полный текст — на листе «Доставка»).
+            # У клиента есть комментарий: выделяем колонку, чтобы шеф заметил его
+            # и на распечатке. Сам текст — всплывающей заметкой в Excel
+            # и полностью на листе «Доставка».
+            cell.font, cell.fill = HAS_COMMENT_FONT, HAS_COMMENT_FILL
             cell.comment = Comment("\n".join(s.comments), "бот")
     ws.row_dimensions[1].height = 120  # высота под вертикальные имена
 
@@ -132,16 +139,22 @@ def _production_sheet(ws: Worksheet, issue: Issue, summaries: list[CustomerSumma
     # --- Оплачено (пустая строка — для отметок ручкой) ---
     ws.cell(row=row, column=2, value="Оплачено").font = BOLD
     ws.row_dimensions[row].height = 28
+    table_end = row
+
+    # Пояснение под таблицей (вне рамок), если есть клиенты с комментариями.
+    if any(s.comments for s in summaries):
+        note = ws.cell(row=row + 2, column=2, value="* — у клиента есть комментарий к заказу, см. лист «Доставка»")
+        note.font = Font(italic=True)
 
     # Рамки для всей таблицы.
-    for r in ws.iter_rows(min_row=1, max_row=row, min_col=1, max_col=max(4, last_col)):
+    for r in ws.iter_rows(min_row=1, max_row=table_end, min_col=1, max_col=max(4, last_col)):
         for cell in r:
             cell.border = BORDER
 
     ws.column_dimensions["A"].width = 4
     ws.column_dimensions["B"].width = 30
     ws.column_dimensions["C"].width = 7
-    ws.column_dimensions["D"].width = 8
+    ws.column_dimensions["D"].width = 9
     for offset in range(len(summaries)):
         ws.column_dimensions[get_column_letter(FIRST_CLIENT_COL + offset)].width = 6
     _print_setup(ws)
