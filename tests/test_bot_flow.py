@@ -504,7 +504,7 @@ async def test_reorder_adds_to_order(harness, monkeypatch):
     await h.click(CLIENT, ListCb(action="next"))
     summary = h.fake.texts()[-1]
     assert "Уже заказано" in summary and "Суп × 3" in summary and "30 €" in summary
-    await h.click(CLIENT, CheckoutCb(action="confirm"))  # данные не спрашиваются
+    await h.click(CLIENT, CheckoutCb(action="add_to", rid=0))  # «Завершить заказ» — данные не спрашиваются
     assert "Комментарий к добавке" in h.fake.texts()[-1]
     await h.click(CLIENT, CheckoutCb(action="skip"))
     assert "Добавлено к заказу" in h.fake.texts()[-1]
@@ -519,3 +519,110 @@ async def test_reorder_adds_to_order(harness, monkeypatch):
     await h.click(CLIENT, MyOrderCb(action="cancel_yes", order_id=last.id))
     async with h.maker() as s:
         assert all(o.status == OrderStatus.CANCELLED for o in await s.scalars(select(Order)))
+
+
+
+async def test_gift_order(harness):
+    """
+    Заказ другому получателю: свой заказ + подарок Маше (адрес текстом, потом точка),
+    платит получатель; в таблице подарок рядом с заказчиком; объявление — одно
+    сообщение со всеми заказами; дозаказ предлагает выбрать, куда добавить.
+    """
+    from io import BytesIO
+
+    from openpyxl import load_workbook
+
+    from culinary_bot.db.models import Recipient
+    from culinary_bot.services import orders as order_service
+    from culinary_bot.services.export import build_issue_workbook
+
+    h = harness
+    await h.click(OWNER, DishCb(action="new"))
+    await h.send(OWNER, "Суп")
+    for _ in range(4):
+        await h.click(OWNER, DishCb(action="skip"))
+    await h.send(OWNER, "10")
+    await h.click(OWNER, DishCb(action="skip"))
+    await h.click(OWNER, IssueCb(action="new"))
+    await h.send(OWNER, "Выпуск")
+    await h.click(OWNER, IssueCb(action="view", issue_id=1))
+    await h.click(OWNER, IssueCb(action="add_dish", issue_id=1, dish_id=1))
+    await h.send(OWNER, "/connect", chat_id=GROUP)
+    await h.click(OWNER, IssueCb(action="publish_yes", issue_id=1))
+
+    # Свой заказ: адрес текстом, точку пропускаем.
+    await h.click(CLIENT, CardCb(action="plus", index=0, item_id=1))
+    await h.click(CLIENT, CheckoutCb(action="list"))
+    await h.click(CLIENT, ListCb(action="next"))
+    await h.click(CLIENT, CheckoutCb(action="confirm"))
+    await h.click(CLIENT, CheckoutCb(action="privacy"))
+    await h.send(CLIENT, "Ева")
+    await h.send(CLIENT, "557692377")
+    await h.click(CLIENT, CheckoutCb(action="delivery"))
+    await h.send(CLIENT, "Будва, Морская 1")
+    assert "Поставьте точку на карте" in h.fake.texts()[-1]
+    await h.click(CLIENT, CheckoutCb(action="skip_point"))
+    await h.click(CLIENT, CheckoutCb(action="skip"))
+
+    # Подарок Маше: «Итого» предлагает выбор — к своему или другому получателю.
+    await h.click(CLIENT, CardCb(action="plus", index=0, item_id=1))
+    await h.click(CLIENT, CardCb(action="plus", index=0, item_id=1))
+    await h.click(CLIENT, CheckoutCb(action="list"))
+    await h.click(CLIENT, ListCb(action="next"))
+    await h.click(CLIENT, CheckoutCb(action="gift"))
+    await h.send(CLIENT, "Маша")
+    await h.send(CLIENT, "+382 67 111 222")
+    await h.send(CLIENT, "Котор, Доброта 5")
+    await h.location(CLIENT, 42.45, 18.76)  # точка после текстового адреса
+    assert "Кто платит" in h.fake.texts()[-1]
+    await h.click(CLIENT, CheckoutCb(action="payer_rec"))
+    await h.click(CLIENT, CheckoutCb(action="skip"))
+    assert any("Заказ получателю Маша принят" in t for t in h.fake.texts())
+
+    async with h.maker() as s:
+        rec = await s.scalar(select(Recipient))
+        assert rec.name == "Маша" and rec.latitude == 42.45 and rec.address == "Котор, Доброта 5"
+        orders = list(await s.scalars(select(Order).order_by(Order.id)))
+        gift = orders[-1]
+        assert gift.recipient_id == rec.id and gift.payer == "recipient" and gift.address == "Котор, Доброта 5"
+
+    # Другой клиент заказывает между ними, потом Ева дозаказывает Маше.
+    await h.click(3, CardCb(action="plus", index=0, item_id=1))
+    await h.click(3, CheckoutCb(action="list"))
+    await h.click(3, ListCb(action="next"))
+    await h.click(3, CheckoutCb(action="confirm"))
+    await h.click(3, CheckoutCb(action="privacy"))
+    await h.send(3, "Иван")
+    await h.send(3, "555123456")
+    await h.click(3, CheckoutCb(action="pickup"))
+    await h.click(3, CheckoutCb(action="skip"))
+
+    await h.click(CLIENT, CardCb(action="plus", index=0, item_id=1))
+    await h.click(CLIENT, CheckoutCb(action="list"))
+    await h.click(CLIENT, ListCb(action="next"))
+    summary_call = [c for c in h.fake.calls if getattr(c, "reply_markup", None) and "Уже заказано" in (getattr(c, "text", "") or "")][-1]
+    labels = [b.text for row in summary_call.reply_markup.inline_keyboard for b in row]
+    assert any("заказу: Маша" in t for t in labels) and any("моему" in t for t in labels)
+    await h.click(CLIENT, CheckoutCb(action="add_to", rid=rec.id))
+    await h.click(CLIENT, CheckoutCb(action="skip"))
+    await h.time_passes()
+
+    # Таблица: Ева, Ева → Маша, Иван (подарок рядом с заказчиком).
+    async with h.maker() as s:
+        issue = await s.get(Issue, 1)
+        content = build_issue_workbook(issue, await order_service.issue_orders(s, issue))
+    ws = load_workbook(BytesIO(content))["Производство"]
+    headers = [ws.cell(row=1, column=c).value.split("\n")[0] for c in range(5, 8)]
+    assert headers == ["Ева", "Ева → Маша 🎁", "Иван"]
+    assert ws.cell(row=2, column=6).value == 3  # Маше: 2 + дозаказ 1
+
+    # Объявление выдачи — одно сообщение Еве с обоими заказами.
+    await h.click(OWNER, IssueCb(action="close_yes", issue_id=1))
+    await h.click(OWNER, IssueCb(action="announce", issue_id=1))
+    await h.send(OWNER, "Развожу во вторник")
+    await h.send(OWNER, "Забрать в среду")
+    await h.click(OWNER, IssueCb(action="announce_yes", issue_id=1))
+    to_eva = [c.text for c in h.fake.calls if getattr(c, "chat_id", None) == CLIENT and "Развожу во вторник" in (getattr(c, "text", "") or "")]
+    assert len(to_eva) == 1
+    assert "Ваш заказ" in to_eva[0] and "Заказ получателю: Маша" in to_eva[0] and "Оплачивает получатель" in to_eva[0]
+    assert "К оплате вами: 10 €" in to_eva[0]

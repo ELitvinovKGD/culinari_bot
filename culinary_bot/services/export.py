@@ -93,7 +93,9 @@ def _production_sheet(ws: Worksheet, issue: Issue, summaries: list[CustomerSumma
         cell.font, cell.alignment, cell.fill = BOLD, CENTER, GREY
     for offset, s in enumerate(summaries):
         star = " *" if s.comments else ""
-        cell = ws.cell(row=1, column=FIRST_CLIENT_COL + offset, value=f"{s.name}{star}\n{short_place(s)}")
+        # Заказ другому получателю: «Ева → Маша 🎁» — стоит сразу после колонки Евы.
+        name = f"{s.orderer_name} → {s.name} 🎁" if s.recipient_id else s.name
+        cell = ws.cell(row=1, column=FIRST_CLIENT_COL + offset, value=f"{name}{star}\n{short_place(s)}")
         cell.font, cell.alignment, cell.fill = BOLD, VERTICAL, GREY
         if s.comments:
             # У клиента есть комментарий: выделяем колонку, чтобы шеф заметил его
@@ -164,18 +166,25 @@ def _production_sheet(ws: Worksheet, issue: Issue, summaries: list[CustomerSumma
 
 def _delivery_sheet(ws: Worksheet, summaries: list[CustomerSummary]) -> None:
     """Лист «Доставка»: одна строка на клиента — всё, что нужно при развозе."""
-    headers = ["Заказы", "Имя", "Телефон", "Telegram", "Получение", "Адрес", "Карта", "Позиции", "К оплате, €", "Комментарий"]
+    headers = ["Заказы", "Имя", "Телефон", "Telegram", "Получение", "Адрес", "Карта", "Позиции", "К оплате, €", "Оплата", "Комментарий"]
     ws.append(headers)
     for cell in ws[1]:
         cell.font, cell.fill, cell.alignment = BOLD, GREY, CENTER
     for s in summaries:
+        name = f"{s.name} 🎁 (от {s.orderer_name})" if s.recipient_id else s.name
+        if not s.recipient_id:
+            payment = ""
+        elif s.payer == "recipient":
+            payment = "получатель"
+        else:
+            payment = f"заказчик ({s.orderer_name})"
         lines = "\n".join(
             f"{name}{' (от шефа)' if extra else ''} × {qty}" for (name, _portion, _price, extra), qty in s.lines.items()
         )
         ws.append(
             [
                 ", ".join(f"№{n}" for n in s.order_ids),
-                s.name,
+                name,
                 s.phone,
                 f"@{s.username}" if s.username else "",
                 "самовывоз" if s.delivery_type == DeliveryType.PICKUP else "доставка",
@@ -183,6 +192,7 @@ def _delivery_sheet(ws: Worksheet, summaries: list[CustomerSummary]) -> None:
                 "📍 открыть" if s.map_url else "",
                 lines,
                 euros(s.total_cents),
+                payment,
                 "\n".join(s.comments),
             ]
         )
@@ -197,7 +207,7 @@ def _delivery_sheet(ws: Worksheet, summaries: list[CustomerSummary]) -> None:
     for r in ws.iter_rows():
         for cell in r:
             cell.border = BORDER
-    for col, width in enumerate([10, 16, 16, 14, 11, 30, 10, 30, 9, 30], start=1):
+    for col, width in enumerate([10, 18, 16, 14, 11, 30, 10, 30, 9, 14, 30], start=1):
         ws.column_dimensions[get_column_letter(col)].width = width
     _print_setup(ws)
 

@@ -1,5 +1,5 @@
 """
-Оформление заказа: данные клиента, комментарий, создание заказа.
+Оформление заказа: данные клиента, получатель, адрес, комментарий, создание заказа.
 
 Здесь используется FSM (finite state machine, «машина состояний»).
 Проблема: бот спрашивает «Как вас зовут?», а ответ приходит ОТДЕЛЬНЫМ
@@ -9,8 +9,20 @@ FSM запоминает для каждого пользователя «на �
     state.set_state(Checkout.phone) → следующий текст обработает on_phone
 А state.update_data(...) хранит промежуточные ответы (имя до ввода телефона).
 
-Поток (docs/scenarios.md, К1 и К2):
-    «Итого» → [уведомление о данных] → данные (сохранённые или ввод) → комментарий → заказ
+Три пути оформления (docs/scenarios.md, решения от 25–26.11):
+
+    СЕБЕ:      «Итого» → [данные] → «Ваши данные — всё верно?» → комментарий → заказ
+    ДРУГОМУ:   ... → «🎁 Другому получателю» → получатель (из списка или новый)
+               → «Кто платит?» → комментарий → заказ
+    ДОЗАКАЗ:   «Итого» → «Добавить к заказу (себе / для Маши)» → комментарий → заказ
+
+Адрес (свой или получателя) вводится по порядку: сначала текстом, потом,
+по желанию, точка на карте. Можно и сразу точкой или ссылкой из Google Maps.
+
+Режим ввода хранится в данных FSM под ключом "mode":
+    own     — свои данные при оформлении заказа;
+    profile — свои данные из «👤 Мои данные» (без заказа);
+    rec     — данные нового получателя.
 """
 
 from aiogram import Bot, F, Router
@@ -24,12 +36,15 @@ from culinary_bot import texts
 from culinary_bot.bot import keyboards
 from culinary_bot.bot.callbacks import CheckoutCb
 from culinary_bot.bot.handlers import client_orders
-from culinary_bot.db.models import Customer, DeliveryType
+from culinary_bot.config import settings
+from culinary_bot.db.models import Customer, DeliveryType, PayerType
 from culinary_bot.services import ServiceError, geocode
 from culinary_bot.services import customers as customer_service
 from culinary_bot.services import issues as issue_service
 from culinary_bot.services import orders as order_service
+from culinary_bot.services import recipients as recipient_service
 from culinary_bot.services import settings as settings_service
+from culinary_bot.services.money import format_price
 
 router = Router(name="client_checkout")
 
@@ -40,41 +55,55 @@ class Checkout(StatesGroup):
     name = State()
     phone = State()
     delivery = State()  # ждём нажатия кнопки «Доставка/Самовывоз»
-    address = State()  # текст адреса ИЛИ геопозиция
-    address_note = State()  # после геопозиции: подъезд, этаж, ориентир
+    address = State()  # адрес: текст, точка или ссылка из Google Maps
+    point = State()  # после текстового адреса: точка на карте по желанию
+    address_note = State()  # после точки: подъезд, этаж, ориентир
+    rec_name = State()  # имя получателя
+    rec_phone = State()  # телефон получателя
     comment = State()
 
 
 # ---------------------------------------------------------------------------
-# Начало: «Итого → Всё верно»
+# Начало: «Итого»
 # ---------------------------------------------------------------------------
 
 
 @router.callback_query(CheckoutCb.filter(F.action == "confirm"))
-async def cb_confirm(callback: CallbackQuery, state: FSMContext, session: AsyncSession, customer: Customer) -> None:
-    """
-    Клиент подтвердил состав. Дальше — уведомление о данных или сами данные.
-
-    Дозаказ (заказ в этом выпуске уже есть): данные не спрашиваем — адрес тот же,
-    сразу комментарий к добавке.
-    """
+async def cb_confirm(callback: CallbackQuery, state: FSMContext, customer: Customer) -> None:
+    """Новый заказ себе: уведомление о данных (один раз) → данные."""
     await callback.message.edit_reply_markup(reply_markup=None)
-    issue = await issue_service.get_open_issue(session)
-    if issue is not None and await order_service.customer_issue_orders(session, customer, issue):
-        await ask_comment(callback.message, state, adding=True)
-    elif not customer.privacy_accepted:
+    await state.clear()
+    await state.update_data(target="own")
+    if not customer.privacy_accepted:
         await callback.message.answer(texts.PRIVACY_NOTICE, reply_markup=keyboards.single("Понятно", "privacy"))
     else:
         await ask_contact_or_saved(callback.message, state, customer)
     await callback.answer()
 
 
+@router.callback_query(CheckoutCb.filter(F.action == "add_to"))
+async def cb_add_to(callback: CallbackQuery, callback_data: CheckoutCb, state: FSMContext) -> None:
+    """
+    Дозаказ: добавить корзину к уже оформленному заказу (себе — rid=0, или
+    получателю rid). Данные не спрашиваем — адрес тот же. Только комментарий.
+    """
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await state.clear()
+    await state.update_data(target="add", add_rid=callback_data.rid)
+    await ask_comment(callback.message, state, adding=True)
+    await callback.answer()
+
+
 @router.callback_query(CheckoutCb.filter(F.action == "privacy"))
-async def cb_privacy(callback: CallbackQuery, state: FSMContext, customer: Customer) -> None:
-    """Клиент прочитал уведомление о личных данных."""
+async def cb_privacy(callback: CallbackQuery, state: FSMContext, session: AsyncSession, customer: Customer) -> None:
+    """Клиент прочитал уведомление о личных данных — продолжаем, откуда пришёл."""
     customer.privacy_accepted = True
     await callback.message.edit_reply_markup(reply_markup=None)
-    await ask_contact_or_saved(callback.message, state, customer)
+    data = await state.get_data()
+    if data.get("target") == "gift":
+        await ask_recipient(callback.message, state, session, customer)
+    else:
+        await ask_contact_or_saved(callback.message, state, customer)
     await callback.answer()
 
 
@@ -95,27 +124,31 @@ async def ask_contact_or_saved(message: Message, state: FSMContext, customer: Cu
 async def cb_data_ok(callback: CallbackQuery, state: FSMContext) -> None:
     """Сохранённые данные верны — сразу к комментарию."""
     await callback.message.edit_reply_markup(reply_markup=None)
+    await state.update_data(target="own")
     await ask_comment(callback.message, state)
     await callback.answer()
 
 
 @router.callback_query(CheckoutCb.filter(F.action == "data_edit"))
 async def cb_data_edit(callback: CallbackQuery, state: FSMContext, customer: Customer) -> None:
-    """Клиент хочет поменять данные — ввод заново, с кнопками «Оставить прежнее»."""
+    """Клиент хочет поменять свои данные — ввод заново, с кнопками «Оставить прежнее»."""
     await callback.message.edit_reply_markup(reply_markup=None)
+    await state.update_data(target="own")
     await start_contact_input(callback.message, state, customer, editing=True)
     await callback.answer()
 
 
 # ---------------------------------------------------------------------------
-# Ввод данных: имя → телефон → способ получения → адрес
+# Свои данные: имя → телефон → способ получения → адрес
 # ---------------------------------------------------------------------------
 
 
-async def start_contact_input(message: Message, state: FSMContext, customer: Customer, *, editing: bool) -> None:
-    """Начать ввод данных. editing=True — показывать кнопки «Оставить: …»."""
+async def start_contact_input(
+    message: Message, state: FSMContext, customer: Customer, *, editing: bool, mode: str = "own"
+) -> None:
+    """Начать ввод своих данных. editing=True — показывать кнопки «Оставить: …»."""
     await state.set_state(Checkout.name)
-    await state.update_data(editing=editing)
+    await state.update_data(editing=editing, mode=mode)
     kb = keyboards.keep_previous(customer.name) if editing and customer.name else None
     await message.answer(texts.ASK_NAME, reply_markup=kb)
 
@@ -168,93 +201,10 @@ async def cb_delivery(
     await callback.message.edit_reply_markup(reply_markup=None)
     if callback_data.action == "pickup":
         await state.update_data(delivery_type=DeliveryType.PICKUP, address=None, latitude=None, longitude=None)
-        await finish_contact(callback.message, state, customer)
+        await address_done(callback.message, state, session, customer)
     else:
         await state.update_data(delivery_type=DeliveryType.DELIVERY)
         await ask_address(callback.message, state, customer)
-    await callback.answer()
-
-
-async def ask_address(message: Message, state: FSMContext, customer: Customer) -> None:
-    data = await state.get_data()
-    await state.set_state(Checkout.address)
-    has_previous = customer.address or customer.latitude is not None
-    previous = customer.address or "📍 точка на карте"
-    kb = keyboards.keep_previous(previous) if data.get("editing") and has_previous else None
-    await message.answer(texts.ASK_ADDRESS, reply_markup=kb)
-
-
-@router.message(Checkout.address, F.text)
-async def on_address(message: Message, state: FSMContext, customer: Customer) -> None:
-    """
-    Пришёл адрес текстом — или ссылка из Google Maps.
-
-    Ссылку из Карт («Поделиться» → «Копировать ссылку») превращаем в точку:
-    дальше всё как с геопозицией — адрес по карте и вопрос про подъезд/этаж.
-    """
-    link = geocode.find_maps_link(message.text)
-    if link:
-        coords = await geocode.coords_from_link(link)
-        if coords:
-            await ask_point_note(message, state, *coords)
-            return
-        await message.answer(
-            "Не получилось прочитать точку из ссылки. Напишите адрес текстом "
-            "или отправьте точку: 📎 → Геопозиция."
-        )
-        return
-    address = message.text.strip()
-    if len(address) < 5:
-        await message.answer("Адрес слишком короткий — напишите подробнее.")
-        return
-    await state.update_data(address=address, latitude=None, longitude=None)
-    await finish_contact(message, state, customer)
-
-
-@router.message(Checkout.address, F.location)
-async def on_location(message: Message, state: FSMContext) -> None:
-    """
-    Пришла точка на карте (📎 → Геопозиция).
-
-    Координаты точные, но подъезд и этаж по ним не понять — спрашиваем уточнение.
-    """
-    lat, lon = message.location.latitude, message.location.longitude
-    # Если клиент выбрал из списка конкретное место, Telegram присылает его
-    # название и адрес (venue) — берём их, к картам не обращаемся.
-    found = None
-    if message.venue:
-        found = ", ".join(x for x in (message.venue.title, message.venue.address) if x)
-    await ask_point_note(message, state, lat, lon, found)
-
-
-async def ask_point_note(message: Message, state: FSMContext, lat: float, lon: float, found: str | None = None) -> None:
-    """
-    Точка получена (геопозиция или ссылка из Карт): определить адрес текстом
-    и спросить подъезд/этаж/ориентир.
-    """
-    if found is None:
-        found = await geocode.reverse(lat, lon)
-    await state.update_data(latitude=lat, longitude=lon, found_address=found)
-    await state.set_state(Checkout.address_note)
-    hint = f"\n📍 Похоже, это: <b>{texts.esc(found)}</b>" if found else ""
-    await message.answer(texts.ASK_ADDRESS_NOTE + hint, reply_markup=keyboards.single("Пропустить", "skip_note"))
-
-
-@router.message(Checkout.address_note, F.text)
-async def on_address_note(message: Message, state: FSMContext, customer: Customer) -> None:
-    """Уточнение к точке: адрес из карт (если нашёлся) + то, что написал клиент."""
-    data = await state.get_data()
-    parts = [data.get("found_address"), message.text.strip()[:300]]
-    await state.update_data(address=", ".join(x for x in parts if x))
-    await finish_contact(message, state, customer)
-
-
-@router.callback_query(Checkout.address_note, CheckoutCb.filter(F.action == "skip_note"))
-async def cb_skip_note(callback: CallbackQuery, state: FSMContext, customer: Customer) -> None:
-    await callback.message.edit_reply_markup(reply_markup=None)
-    data = await state.get_data()
-    await state.update_data(address=data.get("found_address"))
-    await finish_contact(callback.message, state, customer)
     await callback.answer()
 
 
@@ -275,12 +225,127 @@ async def cb_keep(callback: CallbackQuery, state: FSMContext, session: AsyncSess
         await ask_delivery(callback.message, state, session, customer)
     elif current == Checkout.address.state:
         await state.update_data(address=customer.address, latitude=customer.latitude, longitude=customer.longitude)
-        await finish_contact(callback.message, state, customer)
+        await address_done(callback.message, state, session, customer)
     await callback.answer()
 
 
+# ---------------------------------------------------------------------------
+# Адрес: текст → точка (по желанию); или сразу точка/ссылка → уточнение.
+# Общий для своих данных и для получателя (mode в данных FSM).
+# ---------------------------------------------------------------------------
+
+
+async def ask_address(message: Message, state: FSMContext, customer: Customer | None = None) -> None:
+    data = await state.get_data()
+    await state.set_state(Checkout.address)
+    await state.update_data(address=None, latitude=None, longitude=None, found_address=None)
+    kb = None
+    if customer is not None and data.get("editing") and data.get("mode") != "rec":
+        if customer.address or customer.latitude is not None:
+            kb = keyboards.keep_previous(customer.address or "📍 точка на карте")
+    await message.answer(texts.ASK_ADDRESS, reply_markup=kb)
+
+
+@router.message(Checkout.address, F.text)
+async def on_address(message: Message, state: FSMContext, session: AsyncSession, customer: Customer) -> None:
+    """
+    Пришёл адрес текстом — или ссылка из Google Maps.
+
+    Текст → дальше предлагаем точку на карте (по желанию).
+    Ссылка из Карт («Поделиться» → «Копировать ссылку») → это сразу точка.
+    """
+    link = geocode.find_maps_link(message.text)
+    if link:
+        coords = await geocode.coords_from_link(link)
+        if coords:
+            await ask_point_note(message, state, *coords)
+        else:
+            await message.answer("Не получилось прочитать точку из ссылки. Напишите адрес текстом.")
+        return
+    address = message.text.strip()
+    if len(address) < 5:
+        await message.answer("Адрес слишком короткий — напишите подробнее.")
+        return
+    await state.update_data(address=address[:300])
+    await state.set_state(Checkout.point)
+    await message.answer(texts.ASK_POINT, reply_markup=keyboards.single("Пропустить", "skip_point"))
+
+
+@router.message(Checkout.address, F.location)
+async def on_location(message: Message, state: FSMContext) -> None:
+    """Сразу точка вместо текста (📎 → Геопозиция) — определим адрес и спросим уточнение."""
+    found = None
+    if message.venue:
+        # Клиент выбрал из списка конкретное место — Telegram прислал название и адрес.
+        found = ", ".join(x for x in (message.venue.title, message.venue.address) if x)
+    await ask_point_note(message, state, message.location.latitude, message.location.longitude, found)
+
+
+async def ask_point_note(message: Message, state: FSMContext, lat: float, lon: float, found: str | None = None) -> None:
+    """Точка без текстового адреса: определить адрес по карте и спросить подъезд/этаж."""
+    if found is None:
+        found = await geocode.reverse(lat, lon)
+    await state.update_data(latitude=lat, longitude=lon, found_address=found)
+    await state.set_state(Checkout.address_note)
+    hint = f"\n📍 Похоже, это: <b>{texts.esc(found)}</b>" if found else ""
+    await message.answer(texts.ASK_ADDRESS_NOTE + hint, reply_markup=keyboards.single("Пропустить", "skip_note"))
+
+
+@router.message(Checkout.point, F.location)
+async def on_point(message: Message, state: FSMContext, session: AsyncSession, customer: Customer) -> None:
+    """Точка после текстового адреса — адрес уже есть, просто добавляем координаты."""
+    await state.update_data(latitude=message.location.latitude, longitude=message.location.longitude)
+    await address_done(message, state, session, customer)
+
+
+@router.message(Checkout.point, F.text)
+async def on_point_text(message: Message, state: FSMContext, session: AsyncSession, customer: Customer) -> None:
+    """На шаге «точка» прислали текст: ссылка из Карт — берём точку; иначе подсказываем."""
+    link = geocode.find_maps_link(message.text)
+    coords = await geocode.coords_from_link(link) if link else None
+    if coords is None:
+        await message.answer("Отправьте точку (📎 → Геопозиция) или ссылку из Google Maps — или нажмите «Пропустить».")
+        return
+    await state.update_data(latitude=coords[0], longitude=coords[1])
+    await address_done(message, state, session, customer)
+
+
+@router.callback_query(Checkout.point, CheckoutCb.filter(F.action == "skip_point"))
+async def cb_skip_point(callback: CallbackQuery, state: FSMContext, session: AsyncSession, customer: Customer) -> None:
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await address_done(callback.message, state, session, customer)
+    await callback.answer()
+
+
+@router.message(Checkout.address_note, F.text)
+async def on_address_note(message: Message, state: FSMContext, session: AsyncSession, customer: Customer) -> None:
+    """Уточнение к точке: адрес из карт (если нашёлся) + то, что написал клиент."""
+    data = await state.get_data()
+    parts = [data.get("found_address"), message.text.strip()[:300]]
+    await state.update_data(address=", ".join(x for x in parts if x))
+    await address_done(message, state, session, customer)
+
+
+@router.callback_query(Checkout.address_note, CheckoutCb.filter(F.action == "skip_note"))
+async def cb_skip_note(callback: CallbackQuery, state: FSMContext, session: AsyncSession, customer: Customer) -> None:
+    await callback.message.edit_reply_markup(reply_markup=None)
+    data = await state.get_data()
+    await state.update_data(address=data.get("found_address"))
+    await address_done(callback.message, state, session, customer)
+    await callback.answer()
+
+
+async def address_done(message: Message, state: FSMContext, session: AsyncSession, customer: Customer) -> None:
+    """Адрес собран — дальше зависит от режима: свои данные или получатель."""
+    data = await state.get_data()
+    if data.get("mode") == "rec":
+        await finish_recipient(message, state, session, customer)
+    else:
+        await finish_contact(message, state, customer)
+
+
 async def finish_contact(message: Message, state: FSMContext, customer: Customer) -> None:
-    """Все данные собраны — сохраняем в профиль клиента и спрашиваем комментарий."""
+    """Свои данные собраны — сохраняем в профиль; дальше комментарий (или конец, если из «Мои данные»)."""
     data = await state.get_data()
     customer_service.save_contact(
         customer,
@@ -291,7 +356,122 @@ async def finish_contact(message: Message, state: FSMContext, customer: Customer
         latitude=data.get("latitude"),
         longitude=data.get("longitude"),
     )
+    if data.get("mode") == "profile":
+        await state.clear()
+        await message.answer("Данные сохранены ✅")
+        return
     await ask_comment(message, state)
+
+
+# ---------------------------------------------------------------------------
+# Другому получателю
+# ---------------------------------------------------------------------------
+
+
+@router.callback_query(CheckoutCb.filter(F.action == "gift"))
+async def cb_gift(callback: CallbackQuery, state: FSMContext, session: AsyncSession, customer: Customer) -> None:
+    """«🎁 Другому получателю» — выбрать из записной книжки или добавить нового."""
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await state.clear()
+    await state.update_data(target="gift")
+    if not customer.privacy_accepted:
+        await callback.message.answer(texts.PRIVACY_NOTICE, reply_markup=keyboards.single("Понятно", "privacy"))
+    else:
+        await ask_recipient(callback.message, state, session, customer)
+    await callback.answer()
+
+
+async def ask_recipient(message: Message, state: FSMContext, session: AsyncSession, customer: Customer) -> None:
+    recipients = await recipient_service.list_recipients(session, customer)
+    if not recipients:
+        await start_recipient_input(message, state)
+        return
+    await message.answer("Кому доставить?", reply_markup=keyboards.recipients_choice(recipients))
+
+
+@router.callback_query(CheckoutCb.filter(F.action == "pick_rec"))
+async def cb_pick_rec(
+    callback: CallbackQuery, callback_data: CheckoutCb, state: FSMContext, session: AsyncSession, customer: Customer
+) -> None:
+    """Выбран получатель из списка (проверяем, что он этого клиента)."""
+    try:
+        recipient = await recipient_service.get_recipient(session, customer, callback_data.rid)
+    except ServiceError as error:
+        await callback.answer(str(error), show_alert=True)
+        return
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await state.update_data(target="gift", recipient_id=recipient.id)
+    await ask_payer(callback.message)
+    await callback.answer()
+
+
+@router.callback_query(CheckoutCb.filter(F.action == "new_rec"))
+async def cb_new_rec(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await start_recipient_input(callback.message, state)
+    await callback.answer()
+
+
+async def start_recipient_input(message: Message, state: FSMContext) -> None:
+    await state.update_data(target="gift", mode="rec")
+    await state.set_state(Checkout.rec_name)
+    await message.answer(texts.ASK_REC_NAME)
+
+
+@router.message(Checkout.rec_name, F.text)
+async def on_rec_name(message: Message, state: FSMContext) -> None:
+    name = message.text.strip()
+    if not name or len(name) > 100:
+        await message.answer("Введите имя получателя (до 100 символов).")
+        return
+    await state.update_data(rec_name=name)
+    await state.set_state(Checkout.rec_phone)
+    await message.answer(texts.ASK_REC_PHONE)
+
+
+@router.message(Checkout.rec_phone, F.text)
+async def on_rec_phone(message: Message, state: FSMContext) -> None:
+    try:
+        phone = customer_service.normalize_phone(message.text)
+    except ServiceError as error:
+        await message.answer(str(error))
+        return
+    await state.update_data(rec_phone=phone)
+    await ask_address(message, state)
+
+
+async def finish_recipient(message: Message, state: FSMContext, session: AsyncSession, customer: Customer) -> None:
+    """Новый получатель собран — сохраняем в записную книжку и спрашиваем, кто платит."""
+    data = await state.get_data()
+    try:
+        recipient = await recipient_service.create_recipient(
+            session,
+            customer,
+            name=data["rec_name"],
+            phone=data["rec_phone"],
+            address=data.get("address"),
+            latitude=data.get("latitude"),
+            longitude=data.get("longitude"),
+        )
+    except ServiceError as error:
+        await message.answer(str(error))
+        return
+    await state.update_data(recipient_id=recipient.id)
+    await message.answer(f"Получатель сохранён: {texts.esc(recipient.short())} ✅\nВ следующий раз его можно выбрать из списка.")
+    await ask_payer(message)
+
+
+async def ask_payer(message: Message) -> None:
+    await message.answer(texts.ASK_PAYER, reply_markup=keyboards.payer_choice())
+
+
+@router.callback_query(CheckoutCb.filter(F.action.in_({"payer_me", "payer_rec"})))
+async def cb_payer(callback: CallbackQuery, callback_data: CheckoutCb, state: FSMContext) -> None:
+    await callback.message.edit_reply_markup(reply_markup=None)
+    payer = PayerType.CUSTOMER if callback_data.action == "payer_me" else PayerType.RECIPIENT
+    await state.update_data(payer=payer)
+    await ask_comment(callback.message, state)
+    await callback.answer()
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +488,7 @@ async def ask_comment(message: Message, state: FSMContext, adding: bool = False)
 @router.message(Checkout.comment, F.text)
 async def on_comment(message: Message, state: FSMContext, session: AsyncSession, customer: Customer, bot: Bot) -> None:
     """Пришёл комментарий — оформляем заказ."""
-    await place(message, state, session, customer, bot, comment=message.text[:1000])
+    await place(message, state, session, customer, comment=message.text[:1000])
 
 
 @router.callback_query(Checkout.comment, CheckoutCb.filter(F.action == "skip"))
@@ -317,47 +497,81 @@ async def cb_skip_comment(
 ) -> None:
     """«Пропустить» комментарий — оформляем заказ без него."""
     await callback.message.edit_reply_markup(reply_markup=None)
-    await place(callback.message, state, session, customer, bot, comment=None)
+    await place(callback.message, state, session, customer, comment=None)
     await callback.answer()
 
 
-async def place(
-    message: Message, state: FSMContext, session: AsyncSession, customer: Customer, bot: Bot, *, comment: str | None
-) -> None:
+async def place(message: Message, state: FSMContext, session: AsyncSession, customer: Customer, *, comment: str | None) -> None:
     """
-    Создать заказ.
+    Создать заказ (себе, другому получателю или добавку к существующему).
 
     Пост в группу и уведомление шефу отправляются НЕ сразу: первые минуты
     клиент может нажать «✏️ Изменить». Когда окно закроется, всё разошлёт
     фоновая задача (bot/jobs.py).
     """
+    data = await state.get_data()
     await state.clear()
     issue = await issue_service.get_open_issue(session)
     if issue is None:
         await message.answer(texts.ISSUE_CLOSED)
         return
-    # Уже есть заказ в этом выпуске — это добавка: адрес и контакты берём из него.
-    parts = await order_service.customer_issue_orders(session, customer, issue)
+
+    target = data.get("target", "own")
+    all_parts = await order_service.customer_issue_orders(session, customer, issue)
+    recipient = None
+    payer = None
+    if target == "add":
+        # Добавка к заказу себе (rid=0) или получателю.
+        rid = data.get("add_rid") or None
+        parts = [o for o in all_parts if o.recipient_id == rid]
+    elif target == "gift":
+        try:
+            recipient = await recipient_service.get_recipient(session, customer, data["recipient_id"])
+        except (ServiceError, KeyError):
+            await message.answer(texts.SOMETHING_WRONG)
+            return
+        payer = data.get("payer", PayerType.CUSTOMER)
+        # Тому же получателю уже заказывали в этом выпуске — это добавка к его заказу.
+        parts = [o for o in all_parts if o.recipient_id == recipient.id]
+    else:
+        # Себе. Если заказ себе уже есть — тоже добавка (двух «себе» не бывает).
+        parts = [o for o in all_parts if o.recipient_id is None]
     base = parts[-1] if parts else None
+
     try:
-        order = await order_service.place_order(session, customer, issue, comment, base=base)
+        order = await order_service.place_order(
+            session, customer, issue, comment, base=base, recipient=None if base else recipient, payer=payer
+        )
     except ServiceError as error:
         await message.answer(str(error))
         return
 
-    if base is None:
-        await message.answer(texts.order_accepted(order), reply_markup=await client_orders.order_keyboard(session, order))
+    kb = await client_orders.order_keyboard(session, order)
+    summary = order_service.summarize_by_customer(parts + [order])[0]
+    if base is None and not order.is_gift:
+        await message.answer(texts.order_accepted(order), reply_markup=kb)
+    elif base is None:
+        await message.answer(
+            f"🎁 <b>Заказ получателю {texts.esc(order.name)} принят</b>\n\n{texts.summary_lines(summary)}\n\n"
+            f"Итого: {format_price(order.total_cents)}{texts.payer_note(summary)}\n\n"
+            f"Изменить заказ можно в течение {settings.order_edit_minutes} минут.",
+            reply_markup=kb,
+        )
     else:
-        summary = order_service.summarize_by_customer(parts + [order])[0]
-        await message.answer(texts.order_added(summary), reply_markup=await client_orders.order_keyboard(session, order))
+        await message.answer(texts.order_added(summary), reply_markup=kb)
 
 
 # Если в середине диалога прислали не текст (стикер, фото) — подсказываем.
-@router.message(StateFilter(Checkout.name, Checkout.phone, Checkout.address_note, Checkout.comment))
+@router.message(StateFilter(Checkout.name, Checkout.phone, Checkout.address_note, Checkout.comment, Checkout.rec_name, Checkout.rec_phone))
 async def on_non_text(message: Message) -> None:
     await message.answer("Пожалуйста, ответьте текстом.")
 
 
 @router.message(Checkout.address)
 async def on_address_other(message: Message) -> None:
-    await message.answer("Напишите адрес текстом или отправьте точку: 📎 → Геопозиция.")
+    await message.answer("Напишите адрес текстом — или отправьте точку: 📎 → Геопозиция.")
+
+
+@router.message(Checkout.point)
+async def on_point_other(message: Message) -> None:
+    await message.answer("Отправьте точку (📎 → Геопозиция) или нажмите «Пропустить».")

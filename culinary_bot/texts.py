@@ -65,6 +65,7 @@ BTN_MENU = "🍽 Меню"
 BTN_MY_ORDERS = "🧾 Мои заказы"
 BTN_ADMIN = "⚙️ Админка"
 BTN_WRITE_CHEF = "✉️ Написать шефу"
+BTN_MY_DATA = "👤 Мои данные"
 NO_CHEF_CONTACT = "Шеф пока не указал контакт. Напишите ему в группе."
 
 WELCOME = "Привет! Здесь можно заказать блюда из «Тайной лавки шефа».\nНажмите «🍽 Меню», чтобы посмотреть текущий выпуск."
@@ -84,11 +85,16 @@ PRIVACY_NOTICE = (
 ASK_NAME = "Как вас зовут?"
 ASK_PHONE = "Ваш телефон для связи?\nНапример: +995 555 123 456"
 ASK_DELIVERY = "Доставка или самовывоз?"
-ASK_ADDRESS = (
-    "Адрес доставки? Напишите текстом: улица, дом, подъезд, этаж.\n\n"
-    "Или отправьте точку на карте: 📎 → Геопозиция → выберите место.\n"
-    "Или вставьте ссылку из Google Maps."
+ASK_ADDRESS = "Адрес доставки? Напишите текстом: город, улица, дом, подъезд, этаж."
+ASK_POINT = (
+    "Поставьте точку на карте, чтобы шеф вас быстрее нашёл:\n"
+    "📎 → Геопозиция → выберите место. Или вставьте ссылку из Google Maps.\n\n"
+    "Если не нужно — «Пропустить»."
 )
+ASK_REC_NAME = "🎁 Заказ другому человеку.\nКак зовут получателя?"
+ASK_REC_PHONE = "Телефон получателя — для связи при доставке:"
+ASK_PAYER = "Кто платит за этот заказ?"
+PAYER_LABEL = {"customer": "оплата: заказчик", "recipient": "оплата: получатель"}
 ASK_ADDRESS_NOTE = "Точка получена 📍\nУточните подъезд, этаж или ориентир — или пропустите."
 ASK_COMMENT = "Комментарий к заказу, если нужен.\nНапример: позвонить за час, пожелание по времени."
 DELIVERY_LABEL = {DeliveryType.DELIVERY: "доставка", DeliveryType.PICKUP: "самовывоз"}
@@ -282,17 +288,36 @@ def order_for_customer(order: Order) -> str:
 def order_added(summary: CustomerSummary) -> str:
     """Сообщение клиенту после дозаказа: что теперь в заказе целиком."""
     return (
-        f"✅ <b>Добавлено к заказу</b>\n\n<b>Ваш заказ теперь:</b>\n{summary_lines(summary)}\n\n"
+        f"✅ <b>Добавлено к заказу</b>\n\n<b>{order_title(summary)} теперь:</b>\n{summary_lines(summary)}\n\n"
         f"К оплате: <b>{format_price(summary.total_cents)}</b>\n\n"
         f"Изменить добавку можно в течение {settings.order_edit_minutes} минут."
     )
 
 
+def order_title(summary: CustomerSummary) -> str:
+    """
+    «Ваш заказ» или «🎁 Заказ получателю: Маша».
+
+    Имя не склоняем («для Маша» звучит коряво), поэтому «получателю: Имя».
+    """
+    return f"🎁 Заказ получателю: {esc(summary.name)}" if summary.recipient_id else "Ваш заказ"
+
+
+def payer_note(summary: CustomerSummary) -> str:
+    """Для подарка — кто платит."""
+    if not summary.recipient_id:
+        return ""
+    return " (платит получатель)" if summary.payer == "recipient" else " (платите вы)"
+
+
 def issue_order_card(issue: Issue, summary: CustomerSummary, status: str) -> str:
-    """Одна карточка заказа на выпуск в «Моих заказах» (все части вместе)."""
+    """Одна карточка заказа в «Моих заказах» (все части вместе): себе или получателю."""
+    where = ""
+    if summary.recipient_id:
+        where = f"\nКуда: {esc(summary.address) or '📍 точка на карте'}"
     return (
-        f"<b>Ваш заказ в «{esc(issue.title)}»</b> · {status}\n\n{summary_lines(summary)}\n\n"
-        f"К оплате: <b>{format_price(summary.total_cents)}</b>"
+        f"<b>{order_title(summary)}</b> · «{esc(issue.title)}» · {status}{where}\n\n{summary_lines(summary)}\n\n"
+        f"К оплате: <b>{format_price(summary.total_cents)}</b>{payer_note(summary)}"
     )
 
 
@@ -315,8 +340,14 @@ def order_status_for_admin(order: Order) -> str:
 def order_for_admin(order: Order, title: str = "Заказ") -> str:
     """Карточка заказа для админа: состав, сумма, контакты."""
     username = f" (@{esc(order.username)})" if order.username else ""
+    if order.is_gift:
+        customer = order.customer
+        orderer = esc(customer.name) or "клиент"
+        who = f"{esc(order.name)} 🎁 (заказал(а) {orderer}{username}, {PAYER_LABEL.get(order.payer, '')})"
+    else:
+        who = f"{esc(order.name)}{username}"
     lines = [
-        f"<b>{title} №{order.id}</b> — {esc(order.name)}{username}",
+        f"<b>{title} №{order.id}</b> — {who}",
         f"Статус: {order_status_for_admin(order)} · от {local_time(order.created_at)}",
         "",
         order_lines(order),
@@ -419,14 +450,53 @@ def issue_closed_message(issue: Issue) -> str:
     )
 
 
-def announcement_message(issue: Issue, summary: CustomerSummary, text: str, pickup_address: str | None) -> str:
-    """«📣 Объявить выдачу»: текст шефа + позиции клиента + итог + (самовывоз) адрес."""
-    lines = [esc(text), "", f"<b>Ваш заказ в «{esc(issue.title)}»:</b>"]
-    for (name, _portion, price, _extra), qty in summary.lines.items():
-        lines.append(f"• {esc(name)} × {qty} — {format_price(price * qty)}")
-    lines.append(f"\n<b>К оплате: {format_price(summary.total_cents)}</b>")
-    if summary.delivery_type == DeliveryType.PICKUP and pickup_address:
-        lines.append(f"\nСамовывоз: {esc(pickup_address)}")
+def announcement_message(
+    issue: Issue, summaries: list[CustomerSummary], texts_by_type: dict[str, str | None], pickup_address: str | None
+) -> str:
+    """
+    «📣 Объявить выдачу» — ОДНО сообщение заказчику со всеми его заказами
+    (себе и в подарок), решение от 26.11:
+
+        Всё готово, развожу во вторник.
+
+        Ваш заказ: • Суп × 2 — 20 €
+        🎁 Заказ получателю: Маша (Будва, Морская 5): • Сач × 1 — 17 €
+
+        К оплате вами: 37 €
+    """
+    lines: list[str] = []
+    shown_texts: set[str] = set()
+    for summary in summaries:
+        text = texts_by_type.get(summary.delivery_type) or texts_by_type.get(DeliveryType.DELIVERY) or texts_by_type.get(DeliveryType.PICKUP)
+        if text and text not in shown_texts:
+            lines.append(esc(text))
+            shown_texts.add(text)
+    total_by_me = 0
+    for summary in summaries:
+        where = f" ({esc(summary.address) or '📍 точка на карте'})" if summary.recipient_id else ""
+        lines.append(f"\n<b>{order_title(summary)}{where}:</b>")
+        lines.append(summary_lines(summary))
+        if summary.recipient_id and summary.payer == "recipient":
+            lines.append(f"Оплачивает получатель: {format_price(summary.total_cents)}")
+        else:
+            total_by_me += summary.total_cents
+        if summary.delivery_type == DeliveryType.PICKUP and pickup_address:
+            lines.append(f"Самовывоз: {esc(pickup_address)}")
+    lines.append(f"\n<b>К оплате вами: {format_price(total_by_me)}</b>")
+    return "\n".join(lines)
+
+
+def my_data_text(customer, recipients: list) -> str:
+    """Экран «👤 Мои данные»: основные данные и получатели."""
+    if customer.has_saved_data():
+        own = contact_text(customer.name, customer.phone, customer.delivery_type, customer.address, customer.latitude is not None)
+    else:
+        own = "Пока не заполнены — заполнятся при первом заказе."
+    lines = ["<b>👤 Мои данные</b>", "", own, "", "<b>Получатели</b> (для заказов другим людям):"]
+    if recipients:
+        lines += [f"• {esc(r.short())}" for r in recipients]
+    else:
+        lines.append("пока нет — появятся, когда закажете кому-то «🎁 Другому получателю».")
     return "\n".join(lines)
 
 

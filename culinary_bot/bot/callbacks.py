@@ -46,10 +46,15 @@ class ListCb(CallbackData, prefix="lst"):
 class CheckoutCb(CallbackData, prefix="chk"):
     """
     Шаги оформления: list (к списку), confirm (итого верно), privacy (понятно),
-    data_ok, data_edit, delivery, pickup, keep (оставить прежнее), skip (пропустить).
+    data_ok, data_edit, delivery, pickup, keep (оставить прежнее), skip (пропустить),
+    skip_point, skip_note, gift (другому получателю), pick_rec, new_rec,
+    payer_me, payer_rec, add_to (дозаказ: добавить к заказу получателя rid; 0 — к своему).
+
+    rid — id получателя из записной книжки (0 — заказ себе).
     """
 
     action: str
+    rid: int = 0
 
 
 class MyOrderCb(CallbackData, prefix="my"):
@@ -171,3 +176,10 @@ class SetupCb(CallbackData, prefix="setup"):
 
     action: str
     value: str = ""
+
+
+class ProfileCb(CallbackData, prefix="prof"):
+    """«👤 Мои данные»: edit (изменить свои), del_rec / del_rec_yes (удалить получателя rid)."""
+
+    action: str
+    rid: int = 0

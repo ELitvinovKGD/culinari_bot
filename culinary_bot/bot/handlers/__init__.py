@@ -25,6 +25,7 @@ from culinary_bot.bot.handlers import (
     client_checkout,
     client_menu,
     client_orders,
+    client_profile,
     group,
     start,
 )
@@ -54,7 +55,7 @@ def build_router() -> Router:
     # client_orders раньше client_checkout: кнопка «Мои заказы» должна
     # сработать, даже если клиент бросил оформление на шаге «введите имя»,
     # а не записаться в имя.
-    for module in (client_orders, client_menu, client_checkout):
+    for module in (client_orders, client_profile, client_menu, client_checkout):
         private.include_router(module.router)
 
     root.include_router(private)

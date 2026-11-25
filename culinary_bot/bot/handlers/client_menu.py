@@ -38,16 +38,23 @@ async def current_issue_or_none(session: AsyncSession) -> Issue | None:
     return await issue_service.get_open_issue(session)
 
 
+async def existing_orders(session: AsyncSession, customer: Customer, issue: Issue) -> list[CustomerSummary]:
+    """Все оформленные заказы клиента в этом выпуске: себе и получателям (по сводке на каждый)."""
+    parts = await order_service.customer_issue_orders(session, customer, issue)
+    return order_service.summarize_by_customer(parts)
+
+
 async def existing_order(session: AsyncSession, customer: Customer, issue: Issue) -> CustomerSummary | None:
     """
-    Уже оформленный заказ клиента в этом выпуске (все части вместе) или None.
+    Уже оформленный заказ клиента СЕБЕ в этом выпуске (все части вместе) или None.
 
     Если он есть, меню работает в режиме «дозаказа»: показывает, сколько уже
     заказано, а корзина — это добавка к заказу.
     """
-    parts = await order_service.customer_issue_orders(session, customer, issue)
-    summaries = order_service.summarize_by_customer(parts)
-    return summaries[0] if summaries else None
+    for summary in await existing_orders(session, customer, issue):
+        if summary.recipient_id is None:
+            return summary
+    return None
 
 
 async def card_view(session: AsyncSession, customer: Customer, issue: Issue, index: int):
@@ -229,7 +236,9 @@ async def cb_summary(callback: CallbackQuery, session: AsyncSession, customer: C
     if not cart:
         await callback.answer(texts.CART_EMPTY, show_alert=True)
         return
-    existing = await existing_order(session, customer, issue)
-    text = texts.summary_text(cart, cart_service.cart_total_cents(cart), existing)
-    await replace_message(callback, text, keyboards.summary(adding=existing is not None))
+    all_orders = await existing_orders(session, customer, issue)
+    own = next((s for s in all_orders if s.recipient_id is None), None)
+    gifts = [(s.recipient_id, s.name) for s in all_orders if s.recipient_id is not None]
+    text = texts.summary_text(cart, cart_service.cart_total_cents(cart), own)
+    await replace_message(callback, text, keyboards.summary(has_own=own is not None, gifts=gifts))
     await callback.answer()

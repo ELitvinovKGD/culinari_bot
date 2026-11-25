@@ -133,6 +133,41 @@ class Customer(Base):
         return self.delivery_type == DeliveryType.PICKUP or bool(self.address) or self.latitude is not None
 
 
+class PayerType(StrEnum):
+    """Кто платит за заказ другому получателю."""
+
+    CUSTOMER = "customer"  # заказчик
+    RECIPIENT = "recipient"  # получатель
+
+
+class Recipient(Base):
+    """
+    Получатель из «записной книжки» клиента: «Маша, Будва, Морская 5».
+
+    Когда клиент заказывает другому человеку (в подарок, родителям), данные
+    получателя сохраняются, и в следующий раз их можно выбрать из списка.
+    Удаление «мягкое» (is_deleted): на получателя ссылаются старые заказы.
+    """
+
+    __tablename__ = "recipients"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    customer_id: Mapped[int] = mapped_column(ForeignKey("customers.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(100))
+    phone: Mapped[str] = mapped_column(String(32))
+    address: Mapped[str | None] = mapped_column(Text)
+    latitude: Mapped[float | None] = mapped_column(Float)
+    longitude: Mapped[float | None] = mapped_column(Float)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    def short(self) -> str:
+        """Подпись для кнопки: «Маша · Будва, Морская 5»."""
+        place = self.address or ("📍 точка на карте" if self.latitude is not None else "")
+        text = f"{self.name} · {place}" if place else self.name
+        return text if len(text) <= 40 else text[:39] + "…"
+
+
 class Admin(Base):
     """
     Администратор бота (шеф, помощник, разработчик).
@@ -340,6 +375,11 @@ class Order(Base):
     longitude: Mapped[float | None] = mapped_column(Float)
     comment: Mapped[str | None] = mapped_column(Text)
 
+    # Заказ другому человеку: кому (запись из записной книжки) и кто платит.
+    # Для заказа «себе» оба поля пустые. name/phone/address выше — получателя.
+    recipient_id: Mapped[int | None] = mapped_column(ForeignKey("recipients.id"), index=True)
+    payer: Mapped[str | None] = mapped_column(String(16))
+
     # Когда заказ «сформирован»: через 10 минут после оформления (время на правку)
     # или раньше, если шеф закрыл приём. Пока None — клиент может нажать
     # «✏️ Изменить», а шеф и группа о заказе ещё не знают.
@@ -360,12 +400,18 @@ class Order(Base):
     # коде связанные данные надо загружать заранее, а не при обращении.
     customer: Mapped[Customer] = relationship(back_populates="orders", lazy="selectin")
     issue: Mapped[Issue] = relationship(lazy="selectin")
+    recipient: Mapped["Recipient | None"] = relationship(lazy="selectin")
     items: Mapped[list["OrderItem"]] = relationship(
         back_populates="order",
         order_by="OrderItem.id",
         cascade="all, delete-orphan",
         lazy="selectin",
     )
+
+    @property
+    def is_gift(self) -> bool:
+        """Заказ другому получателю (не себе)."""
+        return self.recipient_id is not None
 
     @property
     def map_url(self) -> str | None:

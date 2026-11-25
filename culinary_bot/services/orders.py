@@ -11,12 +11,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from culinary_bot.db.models import (
     CartItem,
     Customer,
+    DeliveryType,
     Issue,
     IssueItem,
     IssueStatus,
     Order,
     OrderItem,
     OrderStatus,
+    Recipient,
     utcnow,
 )
 from culinary_bot.services import ServiceError
@@ -28,7 +30,13 @@ GROUP_POST_DELETE_WINDOW = timedelta(hours=47, minutes=50)
 
 
 async def place_order(
-    session: AsyncSession, customer: Customer, issue: Issue, comment: str | None, base: Order | None = None
+    session: AsyncSession,
+    customer: Customer,
+    issue: Issue,
+    comment: str | None,
+    base: Order | None = None,
+    recipient: Recipient | None = None,
+    payer: str | None = None,
 ) -> Order:
     """
     Оформить заказ из корзины клиента.
@@ -46,15 +54,28 @@ async def place_order(
     из уже оформленного заказа, а не из профиля — доставка одна, адрес тот же.
     Внутри добавка — отдельная запись Order (у неё своё окно правки и свой пост
     в группе), но клиенту и в таблице все части показываются как один заказ.
+
+    recipient / payer — заказ другому человеку (в подарок): контакты и адрес —
+    получателя, payer — кто платит ("customer" или "recipient").
     """
     if issue.status != IssueStatus.OPEN:
         raise ServiceError("Приём заказов уже закрыт.")
     cart = await cart_service.get_cart(session, customer, issue)
     if not cart:
         raise ServiceError("Корзина пуста — добавьте хотя бы одно блюдо.")
-    source = base if base is not None else customer
-    if base is None and not customer.has_saved_data():
-        raise ServiceError("Не заполнены контактные данные.")
+    if base is not None:
+        source = base
+        recipient_id, payer = base.recipient_id, base.payer
+    elif recipient is not None:
+        source = recipient
+        recipient_id = recipient.id
+    else:
+        source = customer
+        recipient_id, payer = None, None
+        if not customer.has_saved_data():
+            raise ServiceError("Не заполнены контактные данные.")
+    # У получателя нет поля delivery_type: заказ другому — всегда доставка.
+    delivery_type = DeliveryType.DELIVERY if recipient is not None else source.delivery_type
 
     order = Order(
         issue_id=issue.id,
@@ -63,7 +84,9 @@ async def place_order(
         name=source.name,
         phone=source.phone,
         username=customer.username,
-        delivery_type=source.delivery_type,
+        delivery_type=delivery_type,
+        recipient_id=recipient_id,
+        payer=payer,
         address=source.address,
         latitude=source.latitude,
         longitude=source.longitude,
@@ -187,13 +210,21 @@ async def unconfirmed_issue_orders(session: AsyncSession, issue: Issue) -> list[
 
 
 async def is_reorder(session: AsyncSession, order: Order) -> bool:
-    """Есть ли у клиента в этом выпуске другие действующие заказы, оформленные раньше (дозаказ)."""
+    """
+    Это добавка к уже оформленному заказу (тому же получателю) в этом выпуске?
+
+    Заказ себе и заказ Маше — разные заказы, поэтому сравниваем и получателя.
+    """
+    same_recipient = (
+        Order.recipient_id.is_(None) if order.recipient_id is None else Order.recipient_id == order.recipient_id
+    )
     earlier = await session.scalar(
         select(Order.id).where(
             Order.customer_id == order.customer_id,
             Order.issue_id == order.issue_id,
             Order.id < order.id,
             Order.status != OrderStatus.CANCELLED,
+            same_recipient,
         )
     )
     return earlier is not None
@@ -204,14 +235,21 @@ def mark_confirmed(order: Order) -> None:
     order.confirmed_at = utcnow()
 
 
-async def cancel_customer_issue(session: AsyncSession, customer: Customer, issue: Issue) -> list[Order]:
+async def cancel_customer_issue(
+    session: AsyncSession, customer: Customer, issue: Issue, recipient_id: int | None = None
+) -> list[Order]:
     """
     Отменить заказ клиента в выпуске целиком — все его части (основной + добавки).
 
-    Клиент видит один заказ, значит и «❌ Отменить» отменяет его целиком.
+    recipient_id — какой именно заказ: себе (None) или конкретному получателю.
+    Клиент видит один заказ на получателя, значит и «❌ Отменить» отменяет его целиком.
     Возвращает отменённые части (для уведомлений и удаления постов).
     """
-    parts = [o for o in await customer_issue_orders(session, customer, issue) if o.status == OrderStatus.ACCEPTED]
+    parts = [
+        o
+        for o in await customer_issue_orders(session, customer, issue)
+        if o.status == OrderStatus.ACCEPTED and o.recipient_id == recipient_id
+    ]
     if not parts:
         raise ServiceError("Этот заказ уже нельзя отменить.")
     for order in parts:
@@ -312,12 +350,15 @@ class CustomerSummary:
     """
 
     customer_id: int
-    name: str
+    name: str  # имя получателя (для заказа себе — самого клиента)
     phone: str
     username: str | None
     delivery_type: str
     address: str | None
     map_url: str | None = None
+    recipient_id: int | None = None  # None — заказ себе
+    orderer_name: str | None = None  # кто заказал (для подарка — заказчик)
+    payer: str | None = None  # кто платит за подарок: "customer" / "recipient"
     order_ids: list[int] = field(default_factory=list)
     comments: list[str] = field(default_factory=list)
     # {(название, порция, цена, это_позиция_шефа): количество}
@@ -333,16 +374,25 @@ class CustomerSummary:
 
 def summarize_by_customer(orders: list[Order]) -> list[CustomerSummary]:
     """
-    Сложить заказы по клиентам (отменённые пропускаются).
+    Сложить заказы по «доставкам»: клиент + получатель (отменённые пропускаются).
 
-    Контакты берём из ПОСЛЕДНЕГО заказа клиента — он самый актуальный
-    (вдруг человек сменил адрес между заказами).
+    Заказ Евы себе и заказ Евы для Маши — две разные сводки (две доставки).
+    Порядок (решение от 26.11): все заказы одного клиента стоят РЯДОМ —
+    сначала себе, потом подарки, — даже если между ними заказывали другие.
+    Клиенты — по времени их первого заказа.
+
+    Контакты берём из ПОСЛЕДНЕЙ части — она самая актуальная.
     """
-    summaries: dict[int, CustomerSummary] = {}
+    summaries: dict[tuple[int, int | None], CustomerSummary] = {}
+    first_order_of_customer: dict[int, int] = {}
+    first_order_of_group: dict[tuple[int, int | None], int] = {}
     for order in sorted(orders, key=lambda o: o.id):
         if order.status == OrderStatus.CANCELLED:
             continue
-        summary = summaries.get(order.customer_id)
+        key = (order.customer_id, order.recipient_id)
+        first_order_of_customer.setdefault(order.customer_id, order.id)
+        first_order_of_group.setdefault(key, order.id)
+        summary = summaries.get(key)
         if summary is None:
             summary = CustomerSummary(
                 customer_id=order.customer_id,
@@ -352,20 +402,30 @@ def summarize_by_customer(orders: list[Order]) -> list[CustomerSummary]:
                 delivery_type=order.delivery_type,
                 address=order.address,
                 map_url=order.map_url,
+                recipient_id=order.recipient_id,
+                payer=order.payer,
             )
-            summaries[order.customer_id] = summary
+            summaries[key] = summary
         else:
             summary.name, summary.phone, summary.username = order.name, order.phone, order.username
             summary.delivery_type, summary.address = order.delivery_type, order.address
             summary.map_url = order.map_url
+        if order.recipient_id is not None:
+            customer = order.customer
+            summary.orderer_name = customer.name or (f"@{customer.username}" if customer.username else "клиент")
         summary.order_ids.append(order.id)
         if order.comment:
             summary.comments.append(order.comment)
         for item in order.items:
-            key = (item.name, item.portion, item.price_cents, item.is_extra)
-            summary.lines[key] = summary.lines.get(key, 0) + item.quantity
+            line_key = (item.name, item.portion, item.price_cents, item.is_extra)
+            summary.lines[line_key] = summary.lines.get(line_key, 0) + item.quantity
             if item.issue_item_id is not None and not item.is_extra:
                 summary.menu_quantities[item.issue_item_id] = (
                     summary.menu_quantities.get(item.issue_item_id, 0) + item.quantity
                 )
-    return list(summaries.values())
+
+    def position(key: tuple[int, int | None]) -> tuple[int, int, int]:
+        customer_id, recipient_id = key
+        return (first_order_of_customer[customer_id], 0 if recipient_id is None else 1, first_order_of_group[key])
+
+    return [summaries[key] for key in sorted(summaries, key=position)]

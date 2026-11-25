@@ -555,8 +555,9 @@ async def confirm_announce(message: Message, state: FSMContext, session: AsyncSe
     data = await state.get_data()
     issue = await issue_service.get_issue(session, data["issue_id"])
     summaries, _, _ = await announce_plan(session, issue)
+    customers = len({s.customer_id for s in summaries})
     await message.answer(
-        f"Отправить объявление клиентам «{texts.esc(issue.title)}»? Получат: {len(summaries)}.",
+        f"Отправить объявление клиентам «{texts.esc(issue.title)}»? Получат: {customers}.",
         reply_markup=keyboards.confirm(
             "📣 Да, отправить", IssueCb(action="announce_yes", issue_id=issue.id), IssueCb(action="view", issue_id=issue.id)
         ),
@@ -588,18 +589,19 @@ async def cb_announce_yes(
     kb = keyboards.url_button(texts.BTN_WRITE_CHEF, chef_url) if chef_url else None
     orders = await order_service.issue_orders(session, issue, include_cancelled=False)
     tg_ids = {o.customer_id: o.customer.tg_id for o in orders}
-    summaries = order_service.summarize_by_customer(orders)
+    texts_by_type = {DeliveryType.DELIVERY: issue.closing_text, DeliveryType.PICKUP: issue.pickup_text}
+    # Одно сообщение заказчику со ВСЕМИ его заказами — себе и в подарок
+    # (решение от 26.11). Сводки уже идут подряд по клиентам.
+    by_customer: dict[int, list] = {}
+    for summary in order_service.summarize_by_customer(orders):
+        by_customer.setdefault(summary.customer_id, []).append(summary)
     failed: list[str] = []
-    for summary in summaries:
-        text = issue.pickup_text if summary.delivery_type == DeliveryType.PICKUP else issue.closing_text
-        # Если для этой группы текста нет (например, самовывоз появился позже) — берём другой.
-        text = text or issue.closing_text or issue.pickup_text
-        ok = await publisher.send_safe(
-            bot, tg_ids[summary.customer_id], texts.announcement_message(issue, summary, text, pickup_address), kb
-        )
-        if not ok:
-            failed.append(f"{texts.esc(summary.name)} {texts.esc(summary.phone)}")
-    report = f"📣 Объявление отправлено: {len(summaries) - len(failed)} из {len(summaries)}."
+    for customer_id, summaries in by_customer.items():
+        message_text = texts.announcement_message(issue, summaries, texts_by_type, pickup_address)
+        if not await publisher.send_safe(bot, tg_ids[customer_id], message_text, kb):
+            own = summaries[0]
+            failed.append(f"{texts.esc(own.orderer_name or own.name)} {texts.esc(own.phone)}")
+    report = f"📣 Объявление отправлено: {len(by_customer) - len(failed)} из {len(by_customer)}."
     if failed:
         report += "\n\nНе доставлено (бот заблокирован) — свяжитесь вручную:\n" + "\n".join(failed)
     await callback.message.answer(report)

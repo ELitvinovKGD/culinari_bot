@@ -29,10 +29,11 @@ from culinary_bot.bot.callbacks import (
     LeftCb,
     ListCb,
     MyOrderCb,
+    ProfileCb,
     SetCb,
     SetupCb,
 )
-from culinary_bot.db.models import Admin, Dish, Issue, IssueItem, IssueStatus, Order, OrderStatus
+from culinary_bot.db.models import Admin, Dish, Issue, IssueItem, IssueStatus, Order, OrderStatus, Recipient
 from culinary_bot.services.money import format_price
 
 # ---------------------------------------------------------------------------
@@ -44,7 +45,7 @@ def main_menu(is_admin: bool) -> ReplyKeyboardMarkup:
     """Нижняя клавиатура: «Меню», «Мои заказы» и для админов — «Админка»."""
     rows = [
         [KeyboardButton(text=texts.BTN_MENU), KeyboardButton(text=texts.BTN_MY_ORDERS)],
-        [KeyboardButton(text=texts.BTN_WRITE_CHEF)],
+        [KeyboardButton(text=texts.BTN_MY_DATA), KeyboardButton(text=texts.BTN_WRITE_CHEF)],
     ]
     if is_admin:
         rows.append([KeyboardButton(text=texts.BTN_ADMIN)])
@@ -115,10 +116,28 @@ def list_view(
     return kb.as_markup()
 
 
-def summary(adding: bool = False) -> InlineKeyboardMarkup:
-    """Кнопки «Итого». adding=True — дозаказ: «Завершить заказ» вместо «Всё верно»."""
+def summary(has_own: bool = False, gifts: list[tuple[int, str]] | None = None) -> InlineKeyboardMarkup:
+    """
+    Кнопки «Итого».
+
+    Нет заказов в выпуске — «✅ Всё верно».
+    Уже есть заказ себе — «✅ Завершить заказ» (добавить к своему заказу).
+    Есть заказы в подарок — по кнопке «Добавить к заказу для Маши» на каждый
+    (решение от 26.11: дозаказ спрашивает, в какой заказ добавить)
+    и «🎁 Другому получателю» — отдельный новый заказ.
+    """
+    gifts = gifts or []
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Завершить заказ" if adding else "✅ Всё верно", callback_data=CheckoutCb(action="confirm"))
+    if not has_own and not gifts:
+        kb.button(text="✅ Всё верно", callback_data=CheckoutCb(action="confirm"))
+    else:
+        if has_own:
+            kb.button(text="✅ Завершить заказ (добавить к моему)", callback_data=CheckoutCb(action="add_to", rid=0))
+        else:
+            kb.button(text="✅ Оформить себе", callback_data=CheckoutCb(action="confirm"))
+        for rid, name in gifts:
+            kb.button(text=f"🎁 Добавить к заказу: {name}", callback_data=CheckoutCb(action="add_to", rid=rid))
+        kb.button(text="🎁 Другому получателю", callback_data=CheckoutCb(action="gift"))
     kb.button(text="✏️ Изменить", callback_data=CheckoutCb(action="list"))
     return kb.as_markup()
 
@@ -134,6 +153,35 @@ def saved_data() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="✅ Да, оформить", callback_data=CheckoutCb(action="data_ok"))
     kb.button(text="✏️ Изменить", callback_data=CheckoutCb(action="data_edit"))
+    kb.button(text="🎁 Другому получателю", callback_data=CheckoutCb(action="gift"))
+    kb.adjust(2, 1)
+    return kb.as_markup()
+
+
+def recipients_choice(recipients: list[Recipient]) -> InlineKeyboardMarkup:
+    """Кому заказ: получатели из записной книжки + «➕ Новый получатель»."""
+    kb = InlineKeyboardBuilder()
+    for r in recipients:
+        kb.button(text=f"🎁 {r.short()}", callback_data=CheckoutCb(action="pick_rec", rid=r.id))
+    kb.button(text="➕ Новый получатель", callback_data=CheckoutCb(action="new_rec"))
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def payer_choice() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text="💳 Я", callback_data=CheckoutCb(action="payer_me"))
+    kb.button(text="🎁 Получатель", callback_data=CheckoutCb(action="payer_rec"))
+    return kb.as_markup()
+
+
+def my_data(recipients: list[Recipient]) -> InlineKeyboardMarkup:
+    """Кнопки экрана «👤 Мои данные»."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✏️ Изменить мои данные", callback_data=ProfileCb(action="edit"))
+    for r in recipients:
+        kb.button(text=f"🗑 {r.short()}", callback_data=ProfileCb(action="del_rec", rid=r.id))
+    kb.adjust(1)
     return kb.as_markup()
 
 

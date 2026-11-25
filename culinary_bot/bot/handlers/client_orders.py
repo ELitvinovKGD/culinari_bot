@@ -53,16 +53,18 @@ async def my_orders(message: Message, state: FSMContext, session: AsyncSession, 
     current = [o for o in orders if o.issue.status != IssueStatus.FINISHED]
     past = [o for o in orders if o.issue.status == IssueStatus.FINISHED]
 
-    # Группируем части по выпуску: {id выпуска: [части по возрастанию]}.
-    by_issue: dict[int, list[Order]] = {}
+    # Группируем части: одна карточка на (выпуск, получатель) — заказ себе
+    # и заказ для Маши показываются отдельно, добавки — внутри своего заказа.
+    groups: dict[tuple[int, int | None], list[Order]] = {}
     for order in sorted(current, key=lambda o: o.id):
-        by_issue.setdefault(order.issue_id, []).append(order)
+        groups.setdefault((order.issue_id, order.recipient_id), []).append(order)
 
-    for parts in by_issue.values():
+    for parts in groups.values():
         issue = parts[0].issue
         active = [o for o in parts if o.status != OrderStatus.CANCELLED]
         if not active:
-            await message.answer(f"Заказ в «{texts.esc(issue.title)}» отменён.")
+            who = f" получателю {texts.esc(parts[0].name)}" if parts[0].is_gift else ""
+            await message.answer(f"Заказ{who} в «{texts.esc(issue.title)}» отменён.")
             continue
         summary = order_service.summarize_by_customer(active)[0]
         delivered = all(o.status == OrderStatus.DELIVERED for o in active)
@@ -128,13 +130,15 @@ async def cb_cancel_yes(
         # было бы отменить чужой заказ.
         if order.customer_id != customer.id:
             raise ServiceError("Заказ не найден.")
-        # Клиент видит один заказ — отменяем все его части в этом выпуске.
-        cancelled = await order_service.cancel_customer_issue(session, customer, order.issue)
+        # Клиент видит один заказ на получателя — отменяем все его части
+        # (основной + добавки) именно этого заказа: себе или для Маши.
+        cancelled = await order_service.cancel_customer_issue(session, customer, order.issue, order.recipient_id)
     except ServiceError as error:
         await callback.answer(str(error), show_alert=True)
         return
 
-    await replace_message(callback, f"Заказ в «{texts.esc(order.issue.title)}» отменён.")
+    who = f" получателю {texts.esc(order.name)}" if order.is_gift else ""
+    await replace_message(callback, f"Заказ{who} в «{texts.esc(order.issue.title)}» отменён.")
     await callback.answer("Заказ отменён")
     for part in cancelled:
         if part.confirmed_at is None:
