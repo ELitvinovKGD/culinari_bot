@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from culinary_bot import texts
 from culinary_bot.bot import keyboards, publisher
 from culinary_bot.bot.callbacks import SetupCb
+from culinary_bot.services import issues as issue_service
 from culinary_bot.services import settings as settings_service
 
 router = Router(name="group")
@@ -42,13 +43,28 @@ async def cmd_connect(message: Message, session: AsyncSession, is_admin: bool, b
         await message.answer("Боту нужно право «Удалять сообщения» — без него не получится убирать посты отменённых заказов.")
         return
 
+    # Смена группы: /connect в другой группе просто заменяет старую.
+    # Так делается переход с тестовой группы на настоящую.
+    old_id = await settings_service.get_group_chat_id(session)
+    old_title = await settings_service.get_value(session, settings_service.GROUP_TITLE)
     await settings_service.set_value(session, settings_service.GROUP_CHAT_ID, str(message.chat.id))
+    await settings_service.set_value(session, settings_service.GROUP_TITLE, message.chat.title or "")
     await message.answer("Группа подключена ✅ Сюда будут публиковаться выпуски и заказы.")
+
+    if old_id is not None and old_id != message.chat.id:
+        text = f"Группа заменена: «{texts.esc(old_title or 'прежняя')}» → «{texts.esc(message.chat.title)}» ✅"
+        if await issue_service.get_open_issue(session) is not None:
+            text += (
+                "\n\n⚠️ Пост открытого выпуска остался в старой группе — кнопка «🔄 Обновить пост» "
+                "теперь работать не будет. Новые посты о заказах пойдут в новую группу."
+            )
+    else:
+        text = f"Группа «{texts.esc(message.chat.title)}» подключена ✅"
     # Пишем админу в личку: если он шёл по мастеру настройки — следующий шаг
     # под рукой, возвращаться в бота и искать кнопку не нужно.
     await publisher.send_safe(
         bot,
         message.from_user.id,
-        f"Группа «{texts.esc(message.chat.title)}» подключена ✅",
+        text,
         keyboards.setup_buttons(("Дальше: контакт для клиентов →", SetupCb(action="step", value="contact"))),
     )

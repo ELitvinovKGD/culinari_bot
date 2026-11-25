@@ -186,7 +186,23 @@ async def ask_address(message: Message, state: FSMContext, customer: Customer) -
 
 @router.message(Checkout.address, F.text)
 async def on_address(message: Message, state: FSMContext, customer: Customer) -> None:
-    """Пришёл адрес текстом."""
+    """
+    Пришёл адрес текстом — или ссылка из Google Maps.
+
+    Ссылку из Карт («Поделиться» → «Копировать ссылку») превращаем в точку:
+    дальше всё как с геопозицией — адрес по карте и вопрос про подъезд/этаж.
+    """
+    link = geocode.find_maps_link(message.text)
+    if link:
+        coords = await geocode.coords_from_link(link)
+        if coords:
+            await ask_point_note(message, state, *coords)
+            return
+        await message.answer(
+            "Не получилось прочитать точку из ссылки. Напишите адрес текстом "
+            "или отправьте точку: 📎 → Геопозиция."
+        )
+        return
     address = message.text.strip()
     if len(address) < 5:
         await message.answer("Адрес слишком короткий — напишите подробнее.")
@@ -203,11 +219,20 @@ async def on_location(message: Message, state: FSMContext) -> None:
     Координаты точные, но подъезд и этаж по ним не понять — спрашиваем уточнение.
     """
     lat, lon = message.location.latitude, message.location.longitude
-    # Адрес текстом рядом с точкой: если клиент выбрал из списка конкретное место,
-    # Telegram присылает его название и адрес (venue). Иначе спрашиваем у карт.
+    # Если клиент выбрал из списка конкретное место, Telegram присылает его
+    # название и адрес (venue) — берём их, к картам не обращаемся.
+    found = None
     if message.venue:
         found = ", ".join(x for x in (message.venue.title, message.venue.address) if x)
-    else:
+    await ask_point_note(message, state, lat, lon, found)
+
+
+async def ask_point_note(message: Message, state: FSMContext, lat: float, lon: float, found: str | None = None) -> None:
+    """
+    Точка получена (геопозиция или ссылка из Карт): определить адрес текстом
+    и спросить подъезд/этаж/ориентир.
+    """
+    if found is None:
         found = await geocode.reverse(lat, lon)
     await state.update_data(latitude=lat, longitude=lon, found_address=found)
     await state.set_state(Checkout.address_note)

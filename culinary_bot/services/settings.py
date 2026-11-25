@@ -17,6 +17,7 @@ from culinary_bot.services import ServiceError
 
 # Ключи настроек.
 GROUP_CHAT_ID = "group_chat_id"  # ID подключённой группы (команда /connect)
+GROUP_TITLE = "group_title"  # название группы — чтобы показывать шефу, какая подключена
 PICKUP_ENABLED = "pickup_enabled"  # "1" — самовывоз включён, "0" — выключен
 PICKUP_ADDRESS = "pickup_address"  # адрес самовывоза
 ORDER_POST_HEADER = "order_post_header"  # первая строка поста о заказе в группе

@@ -427,6 +427,7 @@ def leftovers(items: list[IssueItem], qty: dict[int, int]) -> InlineKeyboardMark
 def settings(pickup_enabled: bool) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="✏️ Контакт для клиентов", callback_data=FieldCb(entity="setting", field="chef_contact"))
+    kb.button(text="🔄 Сменить группу", callback_data=SetupCb(action="change_group"))
     kb.button(text=f"Самовывоз: {'включён ✅' if pickup_enabled else 'выключен ⛔'}", callback_data=SetCb(action="pickup_toggle"))
     kb.button(text="✏️ Адрес самовывоза", callback_data=FieldCb(entity="setting", field="pickup_address"))
     kb.button(text="✏️ Шапка поста о заказе", callback_data=FieldCb(entity="setting", field="order_post_header"))

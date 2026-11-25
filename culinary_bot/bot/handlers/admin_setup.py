@@ -58,6 +58,7 @@ class CheckItem:
 async def readiness(session: AsyncSession) -> list[CheckItem]:
     """Собрать пункты чек-листа по текущему состоянию базы."""
     group = await settings_service.get_group_chat_id(session)
+    group_title = texts.esc(await settings_service.get_value(session, settings_service.GROUP_TITLE) or "без названия")
     contact = await settings_service.get_value(session, settings_service.CHEF_CONTACT)
     pickup = await settings_service.is_pickup_enabled(session)
     address = await settings_service.get_value(session, settings_service.PICKUP_ADDRESS)
@@ -74,7 +75,7 @@ async def readiness(session: AsyncSession) -> list[CheckItem]:
 
     return [
         CheckItem(
-            "Группа подключена" if group else "Группа не подключена", bool(group), True,
+            f"Группа подключена: «{group_title}»" if group else "Группа не подключена", bool(group), True,
             "👥 Подключить группу", SetupCb(action="step", value="group"),
         ),
         CheckItem(
@@ -148,10 +149,28 @@ DONE_TEXT = (
 )
 
 
-async def show_step(message: Message, state: FSMContext, step: str) -> None:
+CHANGE_GROUP_HELP = (
+    "<b>Сменить группу</b>\n\n"
+    "Сейчас подключена: «{title}».\n\n"
+    "Чтобы перейти в другую (например, с тестовой на настоящую):\n"
+    "1. Добавьте бота в новую группу и сделайте администратором с правом «Удаление сообщений».\n"
+    "2. Напишите в новой группе <code>/connect</code>.\n\n"
+    "Новая группа заменит старую. Совет: меняйте группу между выпусками — "
+    "пост уже открытого выпуска останется в старой группе."
+)
+
+
+async def show_step(message: Message, state: FSMContext, step: str, session: AsyncSession | None = None) -> None:
     """Показать шаг мастера: group, contact, pickup, done."""
     await state.clear()
-    if step == "group":
+    group_id = await settings_service.get_group_chat_id(session) if session is not None and step == "group" else None
+    if step == "group" and group_id is not None:
+        title = await settings_service.get_value(session, settings_service.GROUP_TITLE) or "без названия"
+        await message.answer(
+            "<b>Шаг 1 из 3 · Группа</b>\n\n" + CHANGE_GROUP_HELP.format(title=texts.esc(title)).split("\n\n", 1)[1],
+            reply_markup=keyboards.setup_buttons(("Оставить эту группу, дальше →", SetupCb(action="step", value="contact"))),
+        )
+    elif step == "group":
         await message.answer(
             GROUP_HELP,
             reply_markup=keyboards.setup_buttons(
@@ -198,8 +217,16 @@ async def cb_later(callback: CallbackQuery) -> None:
 
 
 @router.callback_query(SetupCb.filter(F.action == "step"))
-async def cb_step(callback: CallbackQuery, callback_data: SetupCb, state: FSMContext) -> None:
-    await show_step(callback.message, state, callback_data.value)
+async def cb_step(callback: CallbackQuery, callback_data: SetupCb, state: FSMContext, session: AsyncSession) -> None:
+    await show_step(callback.message, state, callback_data.value, session)
+    await callback.answer()
+
+
+@router.callback_query(SetupCb.filter(F.action == "change_group"))
+async def cb_change_group(callback: CallbackQuery, session: AsyncSession) -> None:
+    """«🔄 Сменить группу» из настроек — инструкция."""
+    title = await settings_service.get_value(session, settings_service.GROUP_TITLE) or "без названия"
+    await callback.message.answer(CHANGE_GROUP_HELP.format(title=texts.esc(title)))
     await callback.answer()
 
 
@@ -210,7 +237,7 @@ async def cb_group_check(callback: CallbackQuery, state: FSMContext, session: As
         await callback.answer("Пока не вижу группу. Напишите в группе /connect (бот должен быть админом).", show_alert=True)
         return
     await callback.answer("Группа подключена ✅")
-    await show_step(callback.message, state, "contact")
+    await show_step(callback.message, state, "contact", session)
 
 
 @router.message(Setup.contact, F.text)

@@ -49,6 +49,7 @@ async def admin_home(message: Message, state: FSMContext, session: AsyncSession)
 async def settings_text(session: AsyncSession) -> str:
     """Текст экрана настроек с текущими значениями."""
     group = await settings_service.get_group_chat_id(session)
+    group_title = await settings_service.get_value(session, settings_service.GROUP_TITLE) or "без названия"
     address = await settings_service.get_value(session, settings_service.PICKUP_ADDRESS)
     pickup = await settings_service.is_pickup_enabled(session)
     contact = await settings_service.get_value(session, settings_service.CHEF_CONTACT)
@@ -60,7 +61,7 @@ async def settings_text(session: AsyncSession) -> str:
         address_line = "— (самовывоз выключен)"
     return (
         "<b>Настройки</b>\n\n"
-        f"Группа: {'подключена ✅' if group else 'не подключена ⚠️ — добавьте бота в группу админом и напишите там /connect'}\n"
+        f"Группа: {'«' + texts.esc(group_title) + '» ✅' if group else 'не подключена ⚠️ — добавьте бота в группу админом и напишите там /connect'}\n"
         f"Контакт для клиентов: {'@' + texts.esc(contact) if contact else 'не указан ⚠️'}\n"
         f"Адрес самовывоза: {address_line}\n\n"
         f"<b>Пост о заказе в группе:</b>\n{texts.esc(header)}\n• Блюдо — 2\n{texts.esc(footer)}"

@@ -86,7 +86,8 @@ ASK_PHONE = "Ваш телефон для связи?\nНапример: +995 55
 ASK_DELIVERY = "Доставка или самовывоз?"
 ASK_ADDRESS = (
     "Адрес доставки? Напишите текстом: улица, дом, подъезд, этаж.\n\n"
-    "Или отправьте точку на карте: 📎 → Геопозиция → выберите место."
+    "Или отправьте точку на карте: 📎 → Геопозиция → выберите место.\n"
+    "Или вставьте ссылку из Google Maps."
 )
 ASK_ADDRESS_NOTE = "Точка получена 📍\nУточните подъезд, этаж или ориентир — или пропустите."
 ASK_COMMENT = "Комментарий к заказу, если нужен.\nНапример: позвонить за час, пожелание по времени."
@@ -325,7 +326,8 @@ def order_for_admin(order: Order, title: str = "Заказ") -> str:
     ]
     if order.delivery_type == DeliveryType.DELIVERY:
         if order.address:
-            lines.append(f"Адрес: {esc(order.address)}")
+            # <code> — в Telegram такой текст копируется одним нажатием.
+            lines.append(f"Адрес: <code>{esc(order.address)}</code>")
         if order.map_url:
             lines.append(f'📍 <a href="{order.map_url}">Точка на карте</a>')
     if order.comment:

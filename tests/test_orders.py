@@ -244,3 +244,26 @@ def test_bad_username(bad):
 
     with pytest.raises(ServiceError):
         normalize_username(bad)
+
+
+@pytest.mark.parametrize(
+    ("url", "coords"),
+    [
+        ("https://www.google.com/maps/@42.2864,18.8400,17z", (42.2864, 18.84)),
+        ("https://maps.google.com/?q=42.28,18.84", (42.28, 18.84)),
+        ("https://www.google.com/maps/place/X/@42.27,18.83,15z/data=!3m1!4b1!8m2!3d42.2911!4d18.8403", (42.2911, 18.8403)),
+        ("https://www.google.com/maps/search/?api=1&query=42.1%2C19.1", (42.1, 19.1)),
+    ],
+)
+def test_coords_from_maps_link(url, coords):
+    """Ссылка из Google Maps превращается в точку (для точного места берётся !3d/!4d, а не центр карты)."""
+    from culinary_bot.services.geocode import coords_from_url
+
+    assert coords_from_url(url) == coords
+
+
+def test_find_maps_link():
+    from culinary_bot.services.geocode import find_maps_link
+
+    assert find_maps_link("вот https://maps.app.goo.gl/AbC123 спасибо") == "https://maps.app.goo.gl/AbC123"
+    assert find_maps_link("ул. Морская 5, Будва") is None

@@ -442,6 +442,10 @@ async def test_setup_wizard(harness):
     await h.send(OWNER, "/admin")
     assert "Готовность лавки" in h.fake.texts()[-1]
 
+    # Смена группы: /connect в другой группе заменяет старую.
+    await h.send(OWNER, "/connect", chat_id=GROUP - 1)
+    assert any("Группа заменена" in t for t in h.fake.texts())
+
     # Клиент: «✉️ Написать шефу» ведёт на контакт.
     await h.send(CLIENT, "✉️ Написать шефу")
     assert h.fake.calls[-1].reply_markup.inline_keyboard[0][0].url == "https://t.me/chef_anton"

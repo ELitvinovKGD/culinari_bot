@@ -166,7 +166,7 @@ class LeftCb(CallbackData, prefix="left"):
 class SetupCb(CallbackData, prefix="setup"):
     """
     Мастер первой настройки: start, later, group_check, step (перейти к шагу value),
-    pickup_yes, pickup_no, skip.
+    pickup_yes, pickup_no, change_group (инструкция по смене группы из настроек).
     """
 
     action: str
