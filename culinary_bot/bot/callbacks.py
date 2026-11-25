@@ -1,0 +1,159 @@
+"""
+Данные инлайн-кнопок (callback data).
+
+Когда человек нажимает инлайн-кнопку, Telegram присылает боту не текст,
+а короткую строку, которую мы «зашили» в кнопку при создании,
+например "card:plus:15:2". Классы ниже описывают формат этих строк:
+aiogram сам упаковывает поля в строку и распаковывает обратно.
+
+    CardCb(action="plus", item_id=15, index=2).pack()  →  "card:plus:15:2"
+
+Обработчик ловит нужные кнопки фильтром:
+    @router.callback_query(CardCb.filter(F.action == "plus"))
+
+Ограничение Telegram: строка не длиннее 64 байт — поэтому префиксы короткие.
+
+БЕЗОПАСНОСТЬ: данные кнопки присылает клиентское приложение, и в теории их
+можно подделать. Поэтому обработчик ВСЕГДА перепроверяет права:
+что заказ принадлежит этому клиенту, что человек — админ и т.д.
+"""
+
+from aiogram.filters.callback_data import CallbackData
+
+# ---------------------------------------------------------------------------
+# Клиент
+# ---------------------------------------------------------------------------
+
+
+class CardCb(CallbackData, prefix="card"):
+    """Карусель карточек: show (перейти к карточке), plus, minus, noop (ничего)."""
+
+    action: str
+    index: int  # номер карточки в карусели (0, 1, 2...)
+    item_id: int = 0
+
+
+class ListCb(CallbackData, prefix="lst"):
+    """Полный список блюд: plus, minus, card (открыть карточку), next (к «Итого»), noop."""
+
+    action: str
+    item_id: int = 0
+
+
+class CheckoutCb(CallbackData, prefix="chk"):
+    """
+    Шаги оформления: list (к списку), confirm (итого верно), privacy (понятно),
+    data_ok, data_edit, delivery, pickup, keep (оставить прежнее), skip (пропустить).
+    """
+
+    action: str
+
+
+class MyOrderCb(CallbackData, prefix="my"):
+    """«Мои заказы»: cancel (спросить), cancel_yes (подтвердить)."""
+
+    action: str
+    order_id: int
+
+
+class DeleteMeCb(CallbackData, prefix="delme"):
+    """Удаление данных: yes / no."""
+
+    action: str
+
+
+# ---------------------------------------------------------------------------
+# Админка
+# ---------------------------------------------------------------------------
+
+
+class AdmCb(CallbackData, prefix="adm"):
+    """Разделы главного меню админки: home, issues, archive, catalog, archived, settings, admins, notify."""
+
+    section: str
+
+
+class DishCb(CallbackData, prefix="dish"):
+    """
+    Карточка в каталоге: view, new, archive, unarchive.
+
+    issue_id — если блюдо создаётся из выпуска («➕ Блюдо → Новое блюдо»),
+    после создания оно сразу добавится в этот выпуск.
+    """
+
+    action: str
+    dish_id: int = 0
+    issue_id: int = 0
+
+
+class IssueCb(CallbackData, prefix="iss"):
+    """
+    Выпуск: view, new, add (выбрать блюдо), add_dish (добавить конкретное),
+    preview, publish, publish_yes, update_post, orders, excel, close, finish,
+    finish_yes, delete, delete_yes, leftovers, leftovers_from (из уведомления об отмене).
+    """
+
+    action: str
+    issue_id: int = 0
+    dish_id: int = 0
+    order_id: int = 0
+
+
+class ItemCb(CallbackData, prefix="itm"):
+    """
+    Позиция выпуска: view, up, down, off, on, remove, remove_yes, price_all, price_new.
+
+    value — новая цена в центах для price_all/price_new: шеф ввёл цену,
+    а бот спрашивает «применить к оформленным заказам?». Цена ждёт ответа
+    прямо в кнопке — так не нужно хранить её где-то ещё.
+    """
+
+    action: str
+    item_id: int
+    value: int = 0
+
+
+class AOrderCb(CallbackData, prefix="aord"):
+    """Заказ в админке: view, delivered, cancel, cancel_yes, extra, del_extra."""
+
+    action: str
+    order_id: int
+    extra_id: int = 0
+
+
+class FieldCb(CallbackData, prefix="fld"):
+    """
+    Универсальная кнопка «изменить поле».
+
+    entity — что меняем: dish, item, issue, setting;
+    obj_id — id объекта (для setting не нужен);
+    field  — имя поля или ключ настройки;
+    clear  — True для кнопки «🧹 Очистить» (записать пустое значение).
+    Одна кнопка и один обработчик на все поля — см. handlers/admin_fields.py.
+    """
+
+    entity: str
+    obj_id: int = 0
+    field: str
+    clear: bool = False
+
+
+class SetCb(CallbackData, prefix="set"):
+    """Настройки: pickup_toggle, reset (вернуть стандартный текст; key в value)."""
+
+    action: str
+    value: str = ""
+
+
+class AdminsCb(CallbackData, prefix="adms"):
+    """Админы: invite, remove, remove_yes, notify_orders, notify_cancels."""
+
+    action: str
+    admin_id: int = 0
+
+
+class LeftCb(CallbackData, prefix="left"):
+    """Лишние порции: plus, minus, publish, cancel, noop."""
+
+    action: str
+    item_id: int = 0
