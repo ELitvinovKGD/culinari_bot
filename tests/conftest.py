@@ -16,6 +16,8 @@ import os
 # Settings() упадёт без BOT_TOKEN. setdefault не перезапишет настоящие значения.
 os.environ.setdefault("BOT_TOKEN", "123:test")
 os.environ.setdefault("OWNER_TG_ID", "1")
+# Тесты не ходят в интернет: адрес по точке не определяем.
+os.environ.setdefault("GEOCODING_ENABLED", "0")
 
 import pytest  # noqa: E402
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # noqa: E402

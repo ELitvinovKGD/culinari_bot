@@ -36,17 +36,20 @@ async def finalize_order(bot: Bot, session: AsyncSession, order: Order) -> None:
     (тогда ждать конца окна уже не нужно).
     """
     order_service.mark_confirmed(order)
-    reorder = await order_service.is_reorder(session, order)
     # Таблицу уже скачивали — значит, она не учитывает этот заказ.
     excel_outdated = order.issue.excel_exported_at is not None
     await publisher.publish_order(bot, session, order)
-    await publisher.notify_admins(
-        bot,
-        session,
-        texts.new_order_notification(order, reorder=reorder, excel_outdated=excel_outdated),
-        keyboards.new_order_notification(order.id),
-        orders=True,
-    )
+
+    if await order_service.is_reorder(session, order):
+        # Клиент добавил блюда к своему заказу — шефу «✏️ Изменение заказа»
+        # с новым общим итогом по всем частям.
+        parts = await order_service.customer_issue_orders(session, order.customer, order.issue)
+        summaries = order_service.summarize_by_customer(parts)
+        new_total = summaries[0].total_cents if summaries else order.total_cents
+        text = texts.order_change_notification(order, new_total, excel_outdated=excel_outdated)
+    else:
+        text = texts.new_order_notification(order, excel_outdated=excel_outdated)
+    await publisher.notify_admins(bot, session, text, keyboards.new_order_notification(order.id), orders=True)
 
 
 async def confirm_due_orders(bot: Bot, sessionmaker: async_sessionmaker[AsyncSession], minutes: int) -> int:

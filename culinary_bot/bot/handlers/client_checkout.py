@@ -25,7 +25,7 @@ from culinary_bot.bot import keyboards
 from culinary_bot.bot.callbacks import CheckoutCb
 from culinary_bot.bot.handlers import client_orders
 from culinary_bot.db.models import Customer, DeliveryType
-from culinary_bot.services import ServiceError
+from culinary_bot.services import ServiceError, geocode
 from culinary_bot.services import customers as customer_service
 from culinary_bot.services import issues as issue_service
 from culinary_bot.services import orders as order_service
@@ -51,10 +51,18 @@ class Checkout(StatesGroup):
 
 
 @router.callback_query(CheckoutCb.filter(F.action == "confirm"))
-async def cb_confirm(callback: CallbackQuery, state: FSMContext, customer: Customer) -> None:
-    """Клиент подтвердил состав заказа. Дальше — уведомление о данных или сами данные."""
+async def cb_confirm(callback: CallbackQuery, state: FSMContext, session: AsyncSession, customer: Customer) -> None:
+    """
+    Клиент подтвердил состав. Дальше — уведомление о данных или сами данные.
+
+    Дозаказ (заказ в этом выпуске уже есть): данные не спрашиваем — адрес тот же,
+    сразу комментарий к добавке.
+    """
     await callback.message.edit_reply_markup(reply_markup=None)
-    if not customer.privacy_accepted:
+    issue = await issue_service.get_open_issue(session)
+    if issue is not None and await order_service.customer_issue_orders(session, customer, issue):
+        await ask_comment(callback.message, state, adding=True)
+    elif not customer.privacy_accepted:
         await callback.message.answer(texts.PRIVACY_NOTICE, reply_markup=keyboards.single("Понятно", "privacy"))
     else:
         await ask_contact_or_saved(callback.message, state, customer)
@@ -194,21 +202,33 @@ async def on_location(message: Message, state: FSMContext) -> None:
 
     Координаты точные, но подъезд и этаж по ним не понять — спрашиваем уточнение.
     """
-    await state.update_data(latitude=message.location.latitude, longitude=message.location.longitude)
+    lat, lon = message.location.latitude, message.location.longitude
+    # Адрес текстом рядом с точкой: если клиент выбрал из списка конкретное место,
+    # Telegram присылает его название и адрес (venue). Иначе спрашиваем у карт.
+    if message.venue:
+        found = ", ".join(x for x in (message.venue.title, message.venue.address) if x)
+    else:
+        found = await geocode.reverse(lat, lon)
+    await state.update_data(latitude=lat, longitude=lon, found_address=found)
     await state.set_state(Checkout.address_note)
-    await message.answer(texts.ASK_ADDRESS_NOTE, reply_markup=keyboards.single("Пропустить", "skip_note"))
+    hint = f"\n📍 Похоже, это: <b>{texts.esc(found)}</b>" if found else ""
+    await message.answer(texts.ASK_ADDRESS_NOTE + hint, reply_markup=keyboards.single("Пропустить", "skip_note"))
 
 
 @router.message(Checkout.address_note, F.text)
 async def on_address_note(message: Message, state: FSMContext, customer: Customer) -> None:
-    await state.update_data(address=message.text.strip()[:300])
+    """Уточнение к точке: адрес из карт (если нашёлся) + то, что написал клиент."""
+    data = await state.get_data()
+    parts = [data.get("found_address"), message.text.strip()[:300]]
+    await state.update_data(address=", ".join(x for x in parts if x))
     await finish_contact(message, state, customer)
 
 
 @router.callback_query(Checkout.address_note, CheckoutCb.filter(F.action == "skip_note"))
 async def cb_skip_note(callback: CallbackQuery, state: FSMContext, customer: Customer) -> None:
     await callback.message.edit_reply_markup(reply_markup=None)
-    await state.update_data(address=None)
+    data = await state.get_data()
+    await state.update_data(address=data.get("found_address"))
     await finish_contact(callback.message, state, customer)
     await callback.answer()
 
@@ -254,9 +274,10 @@ async def finish_contact(message: Message, state: FSMContext, customer: Customer
 # ---------------------------------------------------------------------------
 
 
-async def ask_comment(message: Message, state: FSMContext) -> None:
+async def ask_comment(message: Message, state: FSMContext, adding: bool = False) -> None:
     await state.set_state(Checkout.comment)
-    await message.answer(texts.ASK_COMMENT, reply_markup=keyboards.single("Пропустить", "skip"))
+    text = "Комментарий к добавке, если нужен." if adding else texts.ASK_COMMENT
+    await message.answer(text, reply_markup=keyboards.single("Пропустить", "skip"))
 
 
 @router.message(Checkout.comment, F.text)
@@ -290,13 +311,20 @@ async def place(
     if issue is None:
         await message.answer(texts.ISSUE_CLOSED)
         return
+    # Уже есть заказ в этом выпуске — это добавка: адрес и контакты берём из него.
+    parts = await order_service.customer_issue_orders(session, customer, issue)
+    base = parts[-1] if parts else None
     try:
-        order = await order_service.place_order(session, customer, issue, comment)
+        order = await order_service.place_order(session, customer, issue, comment, base=base)
     except ServiceError as error:
         await message.answer(str(error))
         return
 
-    await message.answer(texts.order_accepted(order), reply_markup=await client_orders.order_keyboard(session, order))
+    if base is None:
+        await message.answer(texts.order_accepted(order), reply_markup=await client_orders.order_keyboard(session, order))
+    else:
+        summary = order_service.summarize_by_customer(parts + [order])[0]
+        await message.answer(texts.order_added(summary), reply_markup=await client_orders.order_keyboard(session, order))
 
 
 # Если в середине диалога прислали не текст (стикер, фото) — подсказываем.

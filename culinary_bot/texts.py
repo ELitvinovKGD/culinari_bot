@@ -160,9 +160,15 @@ def menu_post_text(issue: Issue, order_link: str | None = None) -> str:
     return "\n\n".join(parts)
 
 
-def card_text(item: IssueItem, index: int, total: int) -> str:
-    """Карточка блюда в карусели клиента (состав — по кнопке «📋 Состав»)."""
-    return f"{item_block(item)}\n\n<i>Блюдо {index + 1} из {total}</i>"
+def card_text(item: IssueItem, index: int, total: int, in_order: int = 0) -> str:
+    """
+    Карточка блюда в карусели клиента (состав — по кнопке «📋 Состав»).
+
+    in_order — сколько этого блюда УЖЕ в оформленном заказе клиента
+    (при дозаказе кнопки −/+ меняют только добавку).
+    """
+    already = f"\n🧾 В вашем заказе: {in_order}" if in_order else ""
+    return f"{item_block(item)}{already}\n\n<i>Блюдо {index + 1} из {total}</i>"
 
 
 # Всплывающее окно Telegram (show_alert) вмещает максимум 200 символов.
@@ -195,9 +201,36 @@ def cart_lines(cart: list[CartItem]) -> str:
     return "\n".join(lines)
 
 
-def summary_text(cart: list[CartItem], total_cents: int) -> str:
-    """Экран «Итого»."""
-    return f"<b>Ваш заказ</b>\n\n{cart_lines(cart)}\n\n<b>Итого: {format_price(total_cents)}</b>"
+def summary_text(cart: list[CartItem], total_cents: int, existing: CustomerSummary | None = None) -> str:
+    """
+    Экран «Итого».
+
+    existing — уже оформленный заказ клиента в этом выпуске (дозаказ).
+    Тогда показываем: что уже заказано, что добавляется, что получится в итоге.
+    """
+    if existing is None:
+        return f"<b>Ваш заказ</b>\n\n{cart_lines(cart)}\n\n<b>Итого: {format_price(total_cents)}</b>"
+    # Что получится в итоге: уже заказанное + добавка, по названию блюда.
+    result: dict[str, int] = {}
+    for (name, _portion, _price, _extra), qty in existing.lines.items():
+        result[name] = result.get(name, 0) + qty
+    for ci in cart:
+        result[ci.issue_item.name] = result.get(ci.issue_item.name, 0) + ci.quantity
+    together = ", ".join(f"{esc(name)} × {qty}" for name, qty in result.items())
+    return (
+        f"<b>Уже заказано:</b>\n{summary_lines(existing)}\n\n"
+        f"<b>Добавляете:</b>\n{cart_lines(cart)}\n\n"
+        f"<b>В итоге:</b> {together}\n"
+        f"<b>К оплате: {format_price(existing.total_cents + total_cents)}</b>"
+    )
+
+
+def summary_lines(summary: CustomerSummary) -> str:
+    """Позиции клиента по всем частям заказа: «• Суп × 3 — 30 €»."""
+    return "\n".join(
+        f"• {esc(name)}{' (от шефа)' if extra else ''} × {qty} — {format_price(price * qty)}"
+        for (name, _portion, price, extra), qty in summary.lines.items()
+    )
 
 
 def contact_text(
@@ -245,6 +278,23 @@ def order_for_customer(order: Order) -> str:
     )
 
 
+def order_added(summary: CustomerSummary) -> str:
+    """Сообщение клиенту после дозаказа: что теперь в заказе целиком."""
+    return (
+        f"✅ <b>Добавлено к заказу</b>\n\n<b>Ваш заказ теперь:</b>\n{summary_lines(summary)}\n\n"
+        f"К оплате: <b>{format_price(summary.total_cents)}</b>\n\n"
+        f"Изменить добавку можно в течение {settings.order_edit_minutes} минут."
+    )
+
+
+def issue_order_card(issue: Issue, summary: CustomerSummary, status: str) -> str:
+    """Одна карточка заказа на выпуск в «Моих заказах» (все части вместе)."""
+    return (
+        f"<b>Ваш заказ в «{esc(issue.title)}»</b> · {status}\n\n{summary_lines(summary)}\n\n"
+        f"К оплате: <b>{format_price(summary.total_cents)}</b>"
+    )
+
+
 def order_reverted() -> str:
     return "Заказ возвращён в корзину ✏️ Поправьте и оформите снова — данные вводить не придётся."
 
@@ -283,14 +333,34 @@ def order_for_admin(order: Order, title: str = "Заказ") -> str:
     return "\n".join(lines)
 
 
-def new_order_notification(order: Order, *, reorder: bool, excel_outdated: bool) -> str:
+def new_order_notification(order: Order, *, excel_outdated: bool) -> str:
     """
-    Уведомление шефу о сформированном заказе.
+    Уведомление шефу о новом сформированном заказе.
 
-    reorder — у клиента уже есть заказ в этом выпуске (дозаказ);
     excel_outdated — таблицу по выпуску уже скачивали, она устарела.
+    Добавка к существующему заказу — см. order_change_notification.
     """
-    text = "🆕 " + order_for_admin(order, "Дозаказ" if reorder else "Новый заказ")
+    text = "🆕 " + order_for_admin(order, "Новый заказ")
+    if excel_outdated:
+        text += "\n\n⚠️ Таблица изменилась — пересоберите «📊 Excel», если уже распечатали."
+    return text
+
+
+def order_change_notification(order: Order, new_total_cents: int, *, excel_outdated: bool) -> str:
+    """
+    Клиент добавил блюда к своему заказу: «✏️ Изменение заказа — Ева: + Суп × 1».
+
+    Формулировка «изменение», а не «дозаказ» — так же потом можно будет
+    показывать и уменьшение порций (если шеф это разрешит).
+    """
+    username = f" (@{esc(order.username)})" if order.username else ""
+    added = "\n".join(f"+ {esc(item.name)} × {item.quantity}" for item in order.items)
+    text = (
+        f"✏️ <b>Изменение заказа</b> — {esc(order.name)}{username} (часть №{order.id})\n\n{added}\n\n"
+        f"Новый итог клиента: <b>{format_price(new_total_cents)}</b>"
+    )
+    if order.comment:
+        text += f"\nКомментарий: {esc(order.comment)}"
     if excel_outdated:
         text += "\n\n⚠️ Таблица изменилась — пересоберите «📊 Excel», если уже распечатали."
     return text

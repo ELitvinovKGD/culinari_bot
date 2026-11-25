@@ -18,13 +18,17 @@ from culinary_bot.db.models import Customer, IssueStatus, Order, OrderStatus
 from culinary_bot.services import ServiceError
 from culinary_bot.services import orders as order_service
 from culinary_bot.services import settings as settings_service
-from culinary_bot.services.money import format_price
 
 router = Router(name="client_orders")
 
 
 async def order_keyboard(session: AsyncSession, order: Order):
-    """Кнопки под заказом клиента (зависят от времени, статуса и открытости лавки)."""
+    """
+    Кнопки под заказом клиента.
+
+    «✏️ Изменить» относится к последней части (основной заказ или добавка),
+    пока у неё идёт окно правки. «❌ Отменить» отменяет заказ в выпуске целиком.
+    """
     return keyboards.my_order(
         order,
         editable=order_service.is_editable(order, settings.order_edit_minutes),
@@ -37,27 +41,35 @@ async def order_keyboard(session: AsyncSession, order: Order):
 @router.message(Command("orders"))
 async def my_orders(message: Message, state: FSMContext, session: AsyncSession, customer: Customer) -> None:
     """
-    Показать заказы: текущие — отдельными сообщениями с кнопкой «Отменить»,
-    прошлые — одним сообщением-историей.
+    «Мои заказы»: по каждому незавершённому выпуску — ОДНА карточка
+    (основной заказ и все добавки вместе), ниже — история.
     """
     await state.clear()
-    orders = await order_service.customer_orders(session, customer)
+    orders = await order_service.customer_orders(session, customer, limit=50)
     if not orders:
         await message.answer("Заказов пока нет. Загляните в «🍽 Меню».")
         return
 
-    # «Текущие» — из выпусков, которые ещё не завершены.
     current = [o for o in orders if o.issue.status != IssueStatus.FINISHED]
     past = [o for o in orders if o.issue.status == IssueStatus.FINISHED]
 
-    for order in reversed(current):  # по возрастанию номера
-        await message.answer(texts.order_for_customer(order), reply_markup=await order_keyboard(session, order))
+    # Группируем части по выпуску: {id выпуска: [части по возрастанию]}.
+    by_issue: dict[int, list[Order]] = {}
+    for order in sorted(current, key=lambda o: o.id):
+        by_issue.setdefault(order.issue_id, []).append(order)
 
-    # Итог за выпуск, если действующих заказов в одном выпуске несколько.
-    active = [o for o in current if o.status != OrderStatus.CANCELLED]
-    if len(active) > 1:
-        total = sum(o.total_cents for o in active)
-        await message.answer(f"<b>Итого за выпуск: {format_price(total)}</b> — доставка одна.")
+    for parts in by_issue.values():
+        issue = parts[0].issue
+        active = [o for o in parts if o.status != OrderStatus.CANCELLED]
+        if not active:
+            await message.answer(f"Заказ в «{texts.esc(issue.title)}» отменён.")
+            continue
+        summary = order_service.summarize_by_customer(active)[0]
+        delivered = all(o.status == OrderStatus.DELIVERED for o in active)
+        status = texts.ORDER_STATUS_LABEL[OrderStatus.DELIVERED if delivered else OrderStatus.ACCEPTED]
+        await message.answer(
+            texts.issue_order_card(issue, summary, status), reply_markup=await order_keyboard(session, active[-1])
+        )
 
     if past:
         history = "\n\n".join(texts.order_for_customer(o) for o in past[:10])
@@ -116,20 +128,22 @@ async def cb_cancel_yes(
         # было бы отменить чужой заказ.
         if order.customer_id != customer.id:
             raise ServiceError("Заказ не найден.")
-        await order_service.cancel_order(session, order, by="customer")
+        # Клиент видит один заказ — отменяем все его части в этом выпуске.
+        cancelled = await order_service.cancel_customer_issue(session, customer, order.issue)
     except ServiceError as error:
         await callback.answer(str(error), show_alert=True)
         return
 
-    await replace_message(callback, texts.order_for_customer(order))
+    await replace_message(callback, f"Заказ в «{texts.esc(order.issue.title)}» отменён.")
     await callback.answer("Заказ отменён")
-    if order.confirmed_at is None:
-        return  # отменён в окне правки: шеф и группа о нём ещё не знали — сообщать нечего
-    await publisher.delete_order_post(bot, session, order)
-    await publisher.notify_admins(
-        bot,
-        session,
-        texts.cancel_notification(order, "customer"),
-        keyboards.cancel_notification(order.id, order.issue_id),
-        cancels=True,
-    )
+    for part in cancelled:
+        if part.confirmed_at is None:
+            continue  # отменён в окне правки: шеф и группа о нём ещё не знали
+        await publisher.delete_order_post(bot, session, part)
+        await publisher.notify_admins(
+            bot,
+            session,
+            texts.cancel_notification(part, "customer"),
+            keyboards.cancel_notification(part.id, part.issue_id),
+            cancels=True,
+        )

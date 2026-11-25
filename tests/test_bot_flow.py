@@ -445,3 +445,73 @@ async def test_setup_wizard(harness):
     # Клиент: «✉️ Написать шефу» ведёт на контакт.
     await h.send(CLIENT, "✉️ Написать шефу")
     assert h.fake.calls[-1].reply_markup.inline_keyboard[0][0].url == "https://t.me/chef_anton"
+
+
+async def test_reorder_adds_to_order(harness, monkeypatch):
+    """
+    Дозаказ = «добавить к своему заказу»: видно, что уже заказано, итог считается
+    вместе, данные не спрашиваются, шефу — «✏️ Изменение заказа», в «Моих
+    заказах» — одна карточка, «Отменить» отменяет всё.
+    """
+    from culinary_bot.services import geocode
+
+    async def fake_reverse(lat, lon):
+        return "Медитеранска 5, Будва"
+
+    monkeypatch.setattr(geocode, "reverse", fake_reverse)
+    h = harness
+    await h.click(OWNER, DishCb(action="new"))
+    await h.send(OWNER, "Суп")
+    for _ in range(4):
+        await h.click(OWNER, DishCb(action="skip"))
+    await h.send(OWNER, "10")
+    await h.click(OWNER, DishCb(action="skip"))
+    await h.click(OWNER, IssueCb(action="new"))
+    await h.send(OWNER, "Выпуск")
+    await h.click(OWNER, IssueCb(action="view", issue_id=1))
+    await h.click(OWNER, IssueCb(action="add_dish", issue_id=1, dish_id=1))
+    await h.send(OWNER, "/connect", chat_id=GROUP)
+    await h.click(OWNER, IssueCb(action="publish_yes", issue_id=1))
+
+    # Первый заказ: 2 супа, адрес точкой — адрес подставился по карте.
+    await h.click(CLIENT, CardCb(action="plus", index=0, item_id=1))
+    await h.click(CLIENT, CardCb(action="plus", index=0, item_id=1))
+    await h.click(CLIENT, CheckoutCb(action="list"))
+    await h.click(CLIENT, ListCb(action="next"))
+    await h.click(CLIENT, CheckoutCb(action="confirm"))
+    await h.click(CLIENT, CheckoutCb(action="privacy"))
+    await h.send(CLIENT, "Ева")
+    await h.send(CLIENT, "557692377")
+    await h.click(CLIENT, CheckoutCb(action="delivery"))
+    await h.location(CLIENT, 42.28, 18.84)
+    assert "Похоже, это" in h.fake.texts()[-1]
+    await h.send(CLIENT, "подъезд 2")
+    await h.click(CLIENT, CheckoutCb(action="skip"))
+    await h.time_passes()
+    async with h.maker() as s:
+        first = await s.scalar(select(Order))
+        assert first.address == "Медитеранска 5, Будва, подъезд 2"
+
+    # Дозаказ: карточка показывает «в заказе 2», «Итого» — всё вместе.
+    await h.send(CLIENT, "🍽 Меню")
+    assert "В вашем заказе: 2" in h.fake.texts()[-1]
+    await h.click(CLIENT, CardCb(action="plus", index=0, item_id=1))
+    await h.click(CLIENT, CheckoutCb(action="list"))
+    await h.click(CLIENT, ListCb(action="next"))
+    summary = h.fake.texts()[-1]
+    assert "Уже заказано" in summary and "Суп × 3" in summary and "30 €" in summary
+    await h.click(CLIENT, CheckoutCb(action="confirm"))  # данные не спрашиваются
+    assert "Комментарий к добавке" in h.fake.texts()[-1]
+    await h.click(CLIENT, CheckoutCb(action="skip"))
+    assert "Добавлено к заказу" in h.fake.texts()[-1]
+    await h.time_passes()
+    assert any("Изменение заказа" in t and "+ Суп × 1" in t and "30 €" in t for t in h.fake.texts())
+
+    # «Мои заказы» — одна карточка с итогом; отмена — целиком.
+    await h.send(CLIENT, "🧾 Мои заказы")
+    assert "Суп × 3" in h.fake.texts()[-1]
+    async with h.maker() as s:
+        last = (await s.scalars(select(Order).order_by(Order.id.desc()))).first()
+    await h.click(CLIENT, MyOrderCb(action="cancel_yes", order_id=last.id))
+    async with h.maker() as s:
+        assert all(o.status == OrderStatus.CANCELLED for o in await s.scalars(select(Order)))

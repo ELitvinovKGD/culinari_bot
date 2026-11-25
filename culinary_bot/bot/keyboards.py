@@ -85,17 +85,24 @@ def hide_message(index: int) -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
-def list_view(items: list[IssueItem], qty: dict[int, int], total_text: str) -> InlineKeyboardMarkup:
+def list_view(
+    items: list[IssueItem], qty: dict[int, int], total_text: str, in_order: dict[int, int] | None = None
+) -> InlineKeyboardMarkup:
     """
     Полный список блюд: в каждой строке название с ценой и −/количество/+.
+
+    in_order — сколько каждого блюда уже в оформленном заказе (при дозаказе):
+    «01 Суп · 10 € · в заказе 2», а −/+ меняют только добавку.
     """
+    in_order = in_order or {}
     kb = InlineKeyboardBuilder()
     for item in items:
         # Название обрезаем, чтобы кнопка не была слишком длинной.
         name = item.name if len(item.name) <= 22 else item.name[:21] + "…"
+        already = f" · в заказе {in_order[item.id]}" if in_order.get(item.id) else ""
         kb.row(
             InlineKeyboardButton(
-                text=f"{item.position:02d} {name} · {format_price(item.price_cents)}",
+                text=f"{item.position:02d} {name} · {format_price(item.price_cents)}{already}",
                 callback_data=ListCb(action="card", item_id=item.id).pack(),
             )
         )
@@ -108,9 +115,10 @@ def list_view(items: list[IssueItem], qty: dict[int, int], total_text: str) -> I
     return kb.as_markup()
 
 
-def summary() -> InlineKeyboardMarkup:
+def summary(adding: bool = False) -> InlineKeyboardMarkup:
+    """Кнопки «Итого». adding=True — дозаказ: «Завершить заказ» вместо «Всё верно»."""
     kb = InlineKeyboardBuilder()
-    kb.button(text="✅ Всё верно", callback_data=CheckoutCb(action="confirm"))
+    kb.button(text="✅ Завершить заказ" if adding else "✅ Всё верно", callback_data=CheckoutCb(action="confirm"))
     kb.button(text="✏️ Изменить", callback_data=CheckoutCb(action="list"))
     return kb.as_markup()
 

@@ -21,7 +21,9 @@ from culinary_bot.db.models import Customer, Issue, IssueItem
 from culinary_bot.services import ServiceError
 from culinary_bot.services import cart as cart_service
 from culinary_bot.services import issues as issue_service
+from culinary_bot.services import orders as order_service
 from culinary_bot.services.money import format_price
+from culinary_bot.services.orders import CustomerSummary
 
 router = Router(name="client_menu")
 
@@ -34,6 +36,18 @@ router = Router(name="client_menu")
 async def current_issue_or_none(session: AsyncSession) -> Issue | None:
     """Открытый выпуск или None."""
     return await issue_service.get_open_issue(session)
+
+
+async def existing_order(session: AsyncSession, customer: Customer, issue: Issue) -> CustomerSummary | None:
+    """
+    Уже оформленный заказ клиента в этом выпуске (все части вместе) или None.
+
+    Если он есть, меню работает в режиме «дозаказа»: показывает, сколько уже
+    заказано, а корзина — это добавка к заказу.
+    """
+    parts = await order_service.customer_issue_orders(session, customer, issue)
+    summaries = order_service.summarize_by_customer(parts)
+    return summaries[0] if summaries else None
 
 
 async def card_view(session: AsyncSession, customer: Customer, issue: Issue, index: int):
@@ -49,7 +63,10 @@ async def card_view(session: AsyncSession, customer: Customer, issue: Issue, ind
     cart = await cart_service.get_cart(session, customer, issue)
     qty = cart_service.quantities(cart).get(item.id, 0)
     cart_text = texts.cart_button(cart_service.cart_count(cart), cart_service.cart_total_cents(cart))
-    return texts.card_text(item, index, len(items)), keyboards.card(index, len(items), item, qty, cart_text), item.photo_file_id
+    existing = await existing_order(session, customer, issue)
+    in_order = existing.menu_quantities.get(item.id, 0) if existing else 0
+    text = texts.card_text(item, index, len(items), in_order)
+    return text, keyboards.card(index, len(items), item, qty, cart_text), item.photo_file_id
 
 
 async def list_view(session: AsyncSession, customer: Customer, issue: Issue):
@@ -57,7 +74,9 @@ async def list_view(session: AsyncSession, customer: Customer, issue: Issue):
     items = issue_service.active_items(issue)
     cart = await cart_service.get_cart(session, customer, issue)
     total = cart_service.cart_total_cents(cart)
-    return texts.list_view_text(issue), keyboards.list_view(items, cart_service.quantities(cart), format_price(total))
+    existing = await existing_order(session, customer, issue)
+    in_order = existing.menu_quantities if existing else None
+    return texts.list_view_text(issue), keyboards.list_view(items, cart_service.quantities(cart), format_price(total), in_order)
 
 
 async def show_menu(message: Message, session: AsyncSession, customer: Customer) -> None:
@@ -210,5 +229,7 @@ async def cb_summary(callback: CallbackQuery, session: AsyncSession, customer: C
     if not cart:
         await callback.answer(texts.CART_EMPTY, show_alert=True)
         return
-    await replace_message(callback, texts.summary_text(cart, cart_service.cart_total_cents(cart)), keyboards.summary())
+    existing = await existing_order(session, customer, issue)
+    text = texts.summary_text(cart, cart_service.cart_total_cents(cart), existing)
+    await replace_message(callback, text, keyboards.summary(adding=existing is not None))
     await callback.answer()

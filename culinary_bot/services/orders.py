@@ -28,7 +28,7 @@ GROUP_POST_DELETE_WINDOW = timedelta(hours=47, minutes=50)
 
 
 async def place_order(
-    session: AsyncSession, customer: Customer, issue: Issue, comment: str | None
+    session: AsyncSession, customer: Customer, issue: Issue, comment: str | None, base: Order | None = None
 ) -> Order:
     """
     Оформить заказ из корзины клиента.
@@ -41,26 +41,32 @@ async def place_order(
     Название, порция и цена копируются в заказ (снимок на момент оформления).
     Контакты тоже копируются — см. комментарий у models.Order.
     После успешного оформления корзина очищается.
+
+    base — для «дозаказа» (добавить к своему заказу): контакты и адрес берутся
+    из уже оформленного заказа, а не из профиля — доставка одна, адрес тот же.
+    Внутри добавка — отдельная запись Order (у неё своё окно правки и свой пост
+    в группе), но клиенту и в таблице все части показываются как один заказ.
     """
     if issue.status != IssueStatus.OPEN:
         raise ServiceError("Приём заказов уже закрыт.")
     cart = await cart_service.get_cart(session, customer, issue)
     if not cart:
         raise ServiceError("Корзина пуста — добавьте хотя бы одно блюдо.")
-    if not customer.has_saved_data():
+    source = base if base is not None else customer
+    if base is None and not customer.has_saved_data():
         raise ServiceError("Не заполнены контактные данные.")
 
     order = Order(
         issue_id=issue.id,
         customer_id=customer.id,
         status=OrderStatus.ACCEPTED,
-        name=customer.name,
-        phone=customer.phone,
+        name=source.name,
+        phone=source.phone,
         username=customer.username,
-        delivery_type=customer.delivery_type,
-        address=customer.address,
-        latitude=customer.latitude,
-        longitude=customer.longitude,
+        delivery_type=source.delivery_type,
+        address=source.address,
+        latitude=source.latitude,
+        longitude=source.longitude,
         comment=(comment or "").strip() or None,
         items=[
             OrderItem(
@@ -196,6 +202,21 @@ async def is_reorder(session: AsyncSession, order: Order) -> bool:
 def mark_confirmed(order: Order) -> None:
     """Отметить заказ сформированным (окно правки закрыто)."""
     order.confirmed_at = utcnow()
+
+
+async def cancel_customer_issue(session: AsyncSession, customer: Customer, issue: Issue) -> list[Order]:
+    """
+    Отменить заказ клиента в выпуске целиком — все его части (основной + добавки).
+
+    Клиент видит один заказ, значит и «❌ Отменить» отменяет его целиком.
+    Возвращает отменённые части (для уведомлений и удаления постов).
+    """
+    parts = [o for o in await customer_issue_orders(session, customer, issue) if o.status == OrderStatus.ACCEPTED]
+    if not parts:
+        raise ServiceError("Этот заказ уже нельзя отменить.")
+    for order in parts:
+        await cancel_order(session, order, by="customer")
+    return parts
 
 
 def mark_delivered(order: Order) -> None:
