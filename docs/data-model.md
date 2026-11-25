@@ -36,6 +36,7 @@ Admin, AdminInvite, Setting — отдельно
 | tg_id | bigint, уникальный | Telegram ID |
 | username | текст | @username (может не быть) |
 | name, phone, address | текст | Сохранённые данные для следующих заказов |
+| latitude, longitude | число | Точка на карте, если клиент отправил геопозицию |
 | delivery_type | `delivery` / `pickup` | Способ получения |
 | privacy_accepted | bool | Видел уведомление о данных |
 
@@ -53,6 +54,7 @@ Admin, AdminInvite, Setting — отдельно
 | Колонка | Смысл |
 |---|---|
 | emoji, name, description, portion | Как в постах шефа |
+| composition | Состав — клиент видит по кнопке «📋 Состав», в пост не идёт |
 | price_cents | Цена в центах: 10.50 € = 1050 |
 | photo_file_id | ID фото в Telegram |
 | is_archived | Убрано в архив (не удаляем — на блюдо ссылаются выпуски) |
@@ -63,7 +65,8 @@ Admin, AdminInvite, Setting — отдельно
 |---|---|
 | title, header, footer | Название, шапка, текст после списка |
 | status | `draft` → `open` → `closed` → `finished` |
-| closing_text | Текст шефа при закрытии приёма |
+| closing_text, pickup_text | Последнее объявление выдачи: для доставки и для самовывоза |
+| excel_exported_at | Когда скачивали Excel — для предупреждения «таблица изменилась» |
 | group_message_ids, group_text_message_id, group_text_is_caption | Где пост в группе — чтобы обновить |
 | opened_at, closed_at, finished_at | Время переходов |
 
@@ -75,7 +78,7 @@ Admin, AdminInvite, Setting — отдельно
 |---|---|
 | issue_id, dish_id | Выпуск и исходная карточка |
 | position | Номер «01 /», «02 /» |
-| emoji, name, description, portion, price_cents, photo_file_id | Копия из карточки, правится отдельно |
+| emoji, name, description, portion, composition, price_cents, photo_file_id | Копия из карточки, правится отдельно |
 | is_active | False — снято с продажи |
 
 ### cart_items — корзины
@@ -89,7 +92,8 @@ Admin, AdminInvite, Setting — отдельно
 |---|---|
 | id | Номер заказа, сквозной |
 | status | `accepted` / `delivered` / `cancelled` |
-| name, phone, username, delivery_type, address, comment | Снимок данных клиента |
+| name, phone, username, delivery_type, address, latitude, longitude, comment | Снимок данных клиента |
+| confirmed_at | Пусто — идёт окно правки (10 мин): клиент может «✏️ Изменить», шеф ещё не знает. Заполнено — заказ сформирован, пост и уведомление отправлены |
 | group_message_id, group_message_sent_at | Пост о заказе в группе (удаляется при отмене в течение 48 ч) |
 | cancelled_by | `customer` / `admin` |
 
@@ -106,4 +110,4 @@ Admin, AdminInvite, Setting — отдельно
 ### settings — настройки шефа
 
 Пары ключ → значение: `group_chat_id`, `pickup_enabled`, `pickup_address`,
-`order_post_header`, `order_post_footer`. Значения по умолчанию — в `services/settings.py`.
+`order_post_header`, `order_post_footer`, `chef_contact`. Значения по умолчанию — в `services/settings.py`.
