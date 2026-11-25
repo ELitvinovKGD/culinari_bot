@@ -1,65 +1,163 @@
 """
-Excel-файл для шефа: таблица производства и лист доставки (сценарий А8).
+Excel-файл для шефа (сценарий А8) — готовая таблица для печати.
 
-Файл собирается в памяти (BytesIO) и отправляется в Telegram документом —
-на диск сервера ничего не пишется (там были бы телефоны и адреса клиентов).
+Лист 1 «Производство» повторяет бумажную таблицу шефа:
 
-Формат пока стандартный; когда будет пример таблицы шефа — подгоняем здесь.
+    №  | Блюдо        | Цена | Всего порций | Ева     | Ирина  | ...
+       |              |      |              | (центр) | (Котор)|
+    01 | Уха 500 г    | 12   | 11           | 1       | 1      |
+    ...
+       | От шефа, €   |      |              |         | 8      |
+       | Итого, €     |      |              | 94      | 42     |
+       | Оплачено     |      |              |         |        |   ← шеф отмечает ручкой
+
+Имена клиентов повёрнуты вертикально, как у шефа на бумаге, — так
+в ширину листа помещается много клиентов.
+
+Лист 2 «Доставка» — контакты и адреса для развоза.
+
+В клетках записаны готовые ЧИСЛА, а не формулы Excel: таблица собирается
+для печати и одинаково выглядит в любой программе и в превью на телефоне.
+(openpyxl не умеет сохранять формулу вместе с посчитанным значением —
+формулу считает только сам Excel при открытии.)
+
+Файл собирается в памяти и отправляется в Telegram — на диск сервера
+не пишется (в нём телефоны и адреса клиентов).
 """
 
 from io import BytesIO
 
 from openpyxl import Workbook
+from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from culinary_bot.db.models import DeliveryType, Issue, Order
-from culinary_bot.services.orders import summarize_by_customer
+from culinary_bot.services.orders import CustomerSummary, summarize_by_customer
 
 BOLD = Font(bold=True)
-HEADER_FILL = PatternFill("solid", fgColor="EEEEEE")
-THIN = Side(style="thin", color="999999")
+BIG_BOLD = Font(bold=True, size=12)
+GREY = PatternFill("solid", fgColor="EEEEEE")
+THIN = Side(style="thin", color="555555")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
-WRAP = Alignment(wrap_text=True, vertical="top")
+CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
+# textRotation=90 — текст повёрнут снизу вверх, как имена на бумаге шефа.
+VERTICAL = Alignment(horizontal="center", vertical="bottom", text_rotation=90, wrap_text=True)
+
+FIRST_CLIENT_COL = 5  # колонки: A №, B Блюдо, C Цена, D Всего порций, E... клиенты
+
+
+def euros(cents: int) -> int | float:
+    """Центы → число евро для клетки: 1200 → 12, 1250 → 12.5 (без лишнего «.0»)."""
+    return cents // 100 if cents % 100 == 0 else cents / 100
+
+
+def short_place(summary: CustomerSummary) -> str:
+    """Подпись под именем клиента: «самовывоз» или начало адреса."""
+    if summary.delivery_type == DeliveryType.PICKUP:
+        return "самовывоз"
+    address = summary.address or ""
+    return address if len(address) <= 22 else address[:21] + "…"
 
 
 def build_issue_workbook(issue: Issue, orders: list[Order]) -> bytes:
     """
     Собрать .xlsx по выпуску. Отменённые заказы не учитываются.
-
     Возвращает содержимое файла в байтах.
     """
     summaries = summarize_by_customer(orders)
     wb = Workbook()
+    _production_sheet(wb.active, issue, summaries)
+    _delivery_sheet(wb.create_sheet("Доставка"), summaries)
+    buffer = BytesIO()
+    wb.save(buffer)
+    return buffer.getvalue()
 
-    # ---------------- Лист 1: Производство ----------------
-    # Блюда по строкам, клиенты по столбцам, итог — в последнем столбце.
-    ws = wb.active
+
+def _production_sheet(ws: Worksheet, issue: Issue, summaries: list[CustomerSummary]) -> None:
+    """Лист «Производство»: что готовить и кто сколько платит."""
     ws.title = "Производство"
-    header = ["№", "Блюдо", "Порция"] + [s.name for s in summaries] + ["Итого"]
-    ws.append(header)
+    last_col = FIRST_CLIENT_COL + len(summaries) - 1
+
+    # --- Шапка ---
+    for col, title in enumerate(["№", "Блюдо", "Цена, €", "Всего порций"], start=1):
+        cell = ws.cell(row=1, column=col, value=title)
+        cell.font, cell.alignment, cell.fill = BOLD, CENTER, GREY
+    for offset, s in enumerate(summaries):
+        cell = ws.cell(row=1, column=FIRST_CLIENT_COL + offset, value=f"{s.name}\n{short_place(s)}")
+        cell.font, cell.alignment, cell.fill = BOLD, VERTICAL, GREY
+        if s.comments:
+            # Комментарий клиента — всплывающая заметка на его имени
+            # (на печати не видна; полный текст — на листе «Доставка»).
+            cell.comment = Comment("\n".join(s.comments), "бот")
+    ws.row_dimensions[1].height = 120  # высота под вертикальные имена
+
+    # --- Блюда ---
+    row = 2
     for item in issue.items:
         per_customer = [s.menu_quantities.get(item.id, 0) for s in summaries]
         total = sum(per_customer)
         if total == 0 and not item.is_active:
-            continue  # снятое с продажи и никем не заказанное — не нужно в таблице
-        # 0 показываем пустой клеткой — так таблицу легче читать глазами.
-        ws.append([f"{item.position:02d}", item.name, item.portion or ""] + [q or None for q in per_customer] + [total])
-    totals = [sum(s.menu_quantities.values()) for s in summaries]
-    ws.append(["", "Всего порций", ""] + totals + [sum(totals)])
-    _style_table(ws, wide_columns={2: 34, 3: 12})
-    for cell in ws[ws.max_row]:
-        cell.font = BOLD
+            continue  # снятое с продажи и никем не заказанное — не печатаем
+        name = f"{item.name} {item.portion}" if item.portion else item.name
+        ws.cell(row=row, column=1, value=f"{item.position:02d}").alignment = CENTER
+        ws.cell(row=row, column=2, value=name).alignment = LEFT
+        ws.cell(row=row, column=3, value=euros(item.price_cents)).alignment = CENTER
+        total_cell = ws.cell(row=row, column=4, value=total)
+        total_cell.font, total_cell.alignment = BIG_BOLD, CENTER
+        for offset, qty in enumerate(per_customer):
+            # 0 оставляем пустой клеткой — так таблицу легче читать глазами.
+            cell = ws.cell(row=row, column=FIRST_CLIENT_COL + offset, value=qty or None)
+            cell.alignment, cell.font = CENTER, BIG_BOLD
+        ws.row_dimensions[row].height = 28
+        row += 1
 
-    # ---------------- Лист 2: Доставка ----------------
-    ws2 = wb.create_sheet("Доставка")
-    ws2.append(["Заказы", "Имя", "Телефон", "Telegram", "Получение", "Адрес", "Позиции", "Сумма, €", "Комментарий"])
+    # --- Позиции от шефа (если есть) ---
+    extras = [sum(price * qty for (_, _, price, is_extra), qty in s.lines.items() if is_extra) for s in summaries]
+    if any(extras):
+        ws.cell(row=row, column=2, value="От шефа, €").alignment = LEFT
+        for offset, cents in enumerate(extras):
+            ws.cell(row=row, column=FIRST_CLIENT_COL + offset, value=euros(cents) if cents else None).alignment = CENTER
+        row += 1
+
+    # --- Итого к оплате ---
+    ws.cell(row=row, column=2, value="Итого к оплате, €").font = BOLD
+    for offset, s in enumerate(summaries):
+        cell = ws.cell(row=row, column=FIRST_CLIENT_COL + offset, value=euros(s.total_cents))
+        cell.font, cell.alignment, cell.fill = BIG_BOLD, CENTER, GREY
+    row += 1
+
+    # --- Оплачено (пустая строка — для отметок ручкой) ---
+    ws.cell(row=row, column=2, value="Оплачено").font = BOLD
+    ws.row_dimensions[row].height = 28
+
+    # Рамки для всей таблицы.
+    for r in ws.iter_rows(min_row=1, max_row=row, min_col=1, max_col=max(4, last_col)):
+        for cell in r:
+            cell.border = BORDER
+
+    ws.column_dimensions["A"].width = 4
+    ws.column_dimensions["B"].width = 30
+    ws.column_dimensions["C"].width = 7
+    ws.column_dimensions["D"].width = 8
+    for offset in range(len(summaries)):
+        ws.column_dimensions[get_column_letter(FIRST_CLIENT_COL + offset)].width = 6
+    _print_setup(ws)
+
+
+def _delivery_sheet(ws: Worksheet, summaries: list[CustomerSummary]) -> None:
+    """Лист «Доставка»: одна строка на клиента — всё, что нужно при развозе."""
+    headers = ["Заказы", "Имя", "Телефон", "Telegram", "Получение", "Адрес", "Позиции", "К оплате, €", "Комментарий"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.font, cell.fill, cell.alignment = BOLD, GREY, CENTER
     for s in summaries:
         lines = "\n".join(
             f"{name}{' (от шефа)' if extra else ''} × {qty}" for (name, _portion, _price, extra), qty in s.lines.items()
         )
-        ws2.append(
+        ws.append(
             [
                 ", ".join(f"№{n}" for n in s.order_ids),
                 s.name,
@@ -68,34 +166,28 @@ def build_issue_workbook(issue: Issue, orders: list[Order]) -> bytes:
                 "самовывоз" if s.delivery_type == DeliveryType.PICKUP else "доставка",
                 s.address or "",
                 lines,
-                s.total_cents / 100,
+                euros(s.total_cents),
                 "\n".join(s.comments),
             ]
         )
-    _style_table(ws2, wide_columns={2: 16, 3: 16, 4: 14, 5: 11, 6: 30, 7: 34, 8: 9, 9: 30})
-
-    buffer = BytesIO()
-    wb.save(buffer)
-    return buffer.getvalue()
-
-
-def _style_table(ws: Worksheet, wide_columns: dict[int, int]) -> None:
-    """
-    Оформить лист для печати: жирная шапка, рамки, перенос текста,
-    альбомная ориентация, «вписать по ширине страницы».
-    """
-    for cell in ws[1]:
-        cell.font = BOLD
-        cell.fill = HEADER_FILL
-    for row in ws.iter_rows():
-        for cell in row:
+    for r in ws.iter_rows(min_row=2):
+        for cell in r:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    for r in ws.iter_rows():
+        for cell in r:
             cell.border = BORDER
-            cell.alignment = WRAP
-    for col in range(1, ws.max_column + 1):
-        ws.column_dimensions[get_column_letter(col)].width = wide_columns.get(col, 10)
-    ws.freeze_panes = "B2"  # шапка и первый столбец не уезжают при прокрутке
+    for col, width in enumerate([10, 16, 16, 14, 11, 30, 30, 9, 30], start=1):
+        ws.column_dimensions[get_column_letter(col)].width = width
+    _print_setup(ws)
+
+
+def _print_setup(ws: Worksheet) -> None:
+    """Печать: альбомный A4, всё по ширине одного листа, шапка повторяется на каждой странице."""
     ws.page_setup.orientation = "landscape"
+    ws.page_setup.paperSize = ws.PAPERSIZE_A4
     ws.page_setup.fitToWidth = 1
-    ws.page_setup.fitToHeight = 0
+    ws.page_setup.fitToHeight = 0  # 0 — высота не ограничена (сколько понадобится страниц)
     ws.sheet_properties.pageSetUpPr.fitToPage = True
-    ws.print_options.gridLines = True
+    ws.print_title_rows = "1:1"
+    ws.page_margins.left = ws.page_margins.right = 0.4
+    ws.freeze_panes = "E2" if ws.title == "Производство" else "B2"
