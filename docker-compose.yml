@@ -1,0 +1,59 @@
+# docker-compose.yml — описание всех контейнеров проекта и связей между ними.
+#
+# Одна команда поднимает и бота, и базу:
+#     docker compose up --build -d
+# Остановить:
+#     docker compose down
+# Смотреть логи бота:
+#     docker compose logs -f bot
+#
+# Значения вида ${POSTGRES_PASSWORD} Docker Compose берёт из файла .env
+# в этой же папке.
+
+services:
+  # База данных PostgreSQL.
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: culinary
+      POSTGRES_DB: culinary
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      # Том (volume) — папка, которая живёт отдельно от контейнера.
+      # Без него при пересоздании контейнера база стиралась бы вместе с заказами.
+      - pgdata:/var/lib/postgresql/data
+    # Порт базы НЕ открываем наружу (нет секции ports): к базе ходит только бот
+    # внутри сети Docker. Это важно для безопасности на сервере — база с
+    # телефонами и адресами не должна быть доступна из интернета.
+    healthcheck:
+      # Проверка "база готова принимать подключения".
+      test: ["CMD-SHELL", "pg_isready -U culinary -d culinary"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Сам бот.
+  bot:
+    build: .
+    restart: unless-stopped
+    # Все переменные из .env (BOT_TOKEN, OWNER_TG_ID, ...) передаются в контейнер.
+    env_file: .env
+    environment:
+      # Адрес базы собираем здесь: "db" — имя сервиса выше, Docker сам
+      # превращает его в адрес контейнера базы.
+      DATABASE_URL: postgresql+asyncpg://culinary:${POSTGRES_PASSWORD}@db:5432/culinary
+    volumes:
+      # Папка миграций "пробрасывается" из проекта в контейнер. Зачем:
+      # команда `docker compose run --rm bot alembic revision --autogenerate ...`
+      # создаёт файл миграции внутри контейнера — благодаря этой строке
+      # он сразу появляется у тебя в папке migrations/versions/.
+      - ./migrations:/app/migrations
+    depends_on:
+      db:
+        # Запускать бота только когда база реально готова (healthcheck прошёл),
+        # иначе миграции упадут с "connection refused".
+        condition: service_healthy
+
+volumes:
+  pgdata:

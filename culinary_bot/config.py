@@ -1,0 +1,46 @@
+"""
+Настройки приложения.
+
+Все параметры, которые различаются между компьютерами (токен бота, пароль базы,
+ID администратора), берутся из переменных окружения или файла .env, а не пишутся
+в коде. Так один и тот же код работает и у тебя на компьютере, и на сервере,
+а секреты никогда не попадают в Git.
+
+Этот модуль импортируют почти все остальные: `from culinary_bot.config import settings`.
+"""
+
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """
+    Описание всех настроек бота.
+
+    pydantic-settings читает переменные окружения с теми же именами
+    (BOT_TOKEN, OWNER_TG_ID, ...) и проверяет типы. Если, например, OWNER_TG_ID
+    не число — приложение упадёт сразу при запуске с понятной ошибкой,
+    а не через час в середине оформления заказа.
+    """
+
+    # Где искать .env. extra="ignore" — не падать из-за лишних переменных
+    # в .env (например, POSTGRES_PASSWORD нужен только Docker, а не боту).
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    # Токен бота от @BotFather. Обязательный параметр: без него бот не запустится.
+    bot_token: str
+
+    # Telegram ID первого администратора (владельца). Его нельзя удалить через бота,
+    # чтобы нельзя было случайно остаться вообще без админов.
+    owner_tg_id: int
+
+    # Адрес базы данных в формате SQLAlchemy.
+    # "postgresql+asyncpg" означает: база PostgreSQL, драйвер asyncpg.
+    database_url: str = "postgresql+asyncpg://culinary:culinary@localhost:5432/culinary"
+
+    # Подробность журнала (логов).
+    log_level: str = "INFO"
+
+
+# Один общий объект настроек на всё приложение.
+# Создаётся при первом импорте модуля и дальше переиспользуется.
+settings = Settings()  # type: ignore[call-arg]  # значения придут из окружения
