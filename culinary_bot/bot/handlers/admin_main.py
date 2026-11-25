@@ -15,6 +15,7 @@ from culinary_bot import texts
 from culinary_bot.bot import keyboards
 from culinary_bot.bot.callbacks import AdmCb, AdminsCb, SetCb
 from culinary_bot.bot.publisher import deep_link
+from culinary_bot.bot.ui import replace_message
 from culinary_bot.db.models import Admin
 from culinary_bot.services import ServiceError
 from culinary_bot.services import admins as admin_service
@@ -57,26 +58,26 @@ async def cb_section(
     await state.clear()
     section = callback_data.section
     if section == "home":
-        await callback.message.edit_text(HOME_TEXT, reply_markup=keyboards.admin_home())
+        await replace_message(callback, HOME_TEXT, reply_markup=keyboards.admin_home())
     elif section == "issues":
         issues = await issue_service.list_active_issues(session)
-        await callback.message.edit_text("<b>Выпуски</b>", reply_markup=keyboards.issues_list(issues, archive=False))
+        await replace_message(callback, "<b>Выпуски</b>", reply_markup=keyboards.issues_list(issues, archive=False))
     elif section == "archive":
         issues = await issue_service.list_finished_issues(session)
-        await callback.message.edit_text("<b>Архив выпусков</b>", reply_markup=keyboards.issues_list(issues, archive=True))
+        await replace_message(callback, "<b>Архив выпусков</b>", reply_markup=keyboards.issues_list(issues, archive=True))
     elif section == "catalog":
         dishes = await catalog_service.list_dishes(session)
-        await callback.message.edit_text("<b>Каталог блюд</b>", reply_markup=keyboards.catalog(dishes, archived=False))
+        await replace_message(callback, "<b>Каталог блюд</b>", reply_markup=keyboards.catalog(dishes, archived=False))
     elif section == "archived":
         dishes = await catalog_service.list_dishes(session, archived=True)
-        await callback.message.edit_text("<b>Архив блюд</b>", reply_markup=keyboards.catalog(dishes, archived=True))
+        await replace_message(callback, "<b>Архив блюд</b>", reply_markup=keyboards.catalog(dishes, archived=True))
     elif section == "settings":
         pickup = await settings_service.is_pickup_enabled(session)
-        await callback.message.edit_text(await settings_text(session), reply_markup=keyboards.settings(pickup))
+        await replace_message(callback, await settings_text(session), reply_markup=keyboards.settings(pickup))
     elif section == "admins":
         await show_admins(callback, session)
     elif section == "notify":
-        await callback.message.edit_text("<b>Мои уведомления</b>", reply_markup=keyboards.notify(admin))
+        await replace_message(callback, "<b>Мои уведомления</b>", reply_markup=keyboards.notify(admin))
     await callback.answer()
 
 
@@ -97,7 +98,7 @@ async def cb_settings(callback: CallbackQuery, callback_data: SetCb, session: As
     # flush — чтобы следующие чтения в этой же сессии увидели новые значения.
     await session.flush()
     pickup = await settings_service.is_pickup_enabled(session)
-    await callback.message.edit_text(await settings_text(session), reply_markup=keyboards.settings(pickup))
+    await replace_message(callback, await settings_text(session), reply_markup=keyboards.settings(pickup))
     await callback.answer("Сохранено")
 
 
@@ -109,7 +110,7 @@ async def cb_settings(callback: CallbackQuery, callback_data: SetCb, session: As
 async def show_admins(callback: CallbackQuery, session: AsyncSession) -> None:
     admins = await admin_service.list_admins(session)
     lines = [f"{'👑' if a.is_owner else '•'} {texts.esc(a.name) or a.tg_id}" for a in admins]
-    await callback.message.edit_text("<b>Админы</b>\n\n" + "\n".join(lines), reply_markup=keyboards.admins_list(admins))
+    await replace_message(callback, "<b>Админы</b>\n\n" + "\n".join(lines), reply_markup=keyboards.admins_list(admins))
 
 
 @router.callback_query(AdminsCb.filter())

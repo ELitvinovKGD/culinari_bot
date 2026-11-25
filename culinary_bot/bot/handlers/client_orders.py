@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from culinary_bot import texts
 from culinary_bot.bot import keyboards, publisher
 from culinary_bot.bot.callbacks import MyOrderCb
+from culinary_bot.bot.ui import replace_message
 from culinary_bot.db.models import Customer, IssueStatus, OrderStatus
 from culinary_bot.services import ServiceError
 from culinary_bot.services import orders as order_service
@@ -81,7 +82,7 @@ async def cb_cancel_yes(
         await callback.answer(str(error), show_alert=True)
         return
 
-    await callback.message.edit_text(texts.order_for_customer(order))
+    await replace_message(callback, texts.order_for_customer(order))
     await callback.answer("Заказ отменён")
     await publisher.delete_order_post(bot, session, order)
     await publisher.notify_admins(

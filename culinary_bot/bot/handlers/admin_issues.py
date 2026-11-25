@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from culinary_bot import texts
 from culinary_bot.bot import keyboards, publisher
 from culinary_bot.bot.callbacks import IssueCb, ItemCb, LeftCb
+from culinary_bot.bot.ui import replace_message
 from culinary_bot.db.models import Issue, IssueItem, IssueStatus, OrderStatus
 from culinary_bot.services import ServiceError
 from culinary_bot.services import catalog as catalog_service
@@ -356,7 +357,7 @@ async def cb_delete(callback: CallbackQuery, callback_data: IssueCb, session: As
     except ServiceError as error:
         await callback.answer(str(error), show_alert=True)
         return
-    await callback.message.edit_text("Черновик удалён.")
+    await replace_message(callback, "Черновик удалён.")
     await callback.answer()
 
 
@@ -535,7 +536,7 @@ async def cb_leftovers_edit(callback: CallbackQuery, callback_data: LeftCb, stat
         await callback.message.edit_reply_markup(reply_markup=keyboards.leftovers(issue.items, {int(k): v for k, v in qty.items()}))
     elif action == "cancel":
         await state.clear()
-        await callback.message.edit_text("Отменено.")
+        await replace_message(callback, "Отменено.")
     elif action == "publish":
         lines = [(item.name, qty.get(str(item.id), 0)) for item in issue.items if qty.get(str(item.id), 0) > 0]
         if not lines:
@@ -555,5 +556,5 @@ async def cb_leftovers_edit(callback: CallbackQuery, callback_data: LeftCb, stat
             await callback.answer(f"Не удалось опубликовать: {error}", show_alert=True)
             return
         await state.clear()
-        await callback.message.edit_text("🍱 Пост о лишних порциях опубликован.")
+        await replace_message(callback, "🍱 Пост о лишних порциях опубликован.")
     await callback.answer()

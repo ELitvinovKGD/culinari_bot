@@ -17,6 +17,7 @@ from culinary_bot.bot import keyboards
 from culinary_bot.bot.callbacks import DeleteMeCb
 from culinary_bot.bot.handlers import client_menu
 from culinary_bot.bot.publisher import notify_admins
+from culinary_bot.bot.ui import replace_message
 from culinary_bot.db.models import Customer
 from culinary_bot.services import ServiceError
 from culinary_bot.services import admins as admin_service
@@ -81,8 +82,8 @@ async def cb_delete_me(callback: CallbackQuery, callback_data: DeleteMeCb, sessi
     """Ответ на вопрос об удалении данных."""
     if callback_data.action == "yes":
         await customer_service.delete_personal_data(session, customer)
-        await callback.message.edit_text(texts.DELETE_ME_DONE)
+        await replace_message(callback, texts.DELETE_ME_DONE)
     else:
-        await callback.message.edit_text("Хорошо, ничего не удаляем.")
+        await replace_message(callback, "Хорошо, ничего не удаляем.")
     # Каждый callback нужно "ответить", иначе у кнопки будут крутиться часики.
     await callback.answer()

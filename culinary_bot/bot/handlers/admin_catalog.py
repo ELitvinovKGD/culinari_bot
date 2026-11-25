@@ -38,10 +38,20 @@ class NewDish(StatesGroup):
 
 # Шаги по порядку: (состояние, ключ в данных FSM, вопрос, можно ли пропустить).
 STEPS = [
-    (NewDish.name, "name", "Название блюда:", False),
-    (NewDish.emoji, "emoji", "Эмодзи (например 🍲):", True),
-    (NewDish.description, "description", "Описание (одна-две фразы):", True),
-    (NewDish.portion, "portion", "Порция (например «350/100 г» или «5 шт.»):", True),
+    (
+        NewDish.name,
+        "name",
+        "Название — только само блюдо.\nНапример: <i>Борщ</i>",
+        False,
+    ),
+    (NewDish.emoji, "emoji", "Эмодзи блюда (например 🍲) — стоит в посте перед номером.", True),
+    (
+        NewDish.description,
+        "description",
+        "Описание — одна-две фразы.\nНапример: <i>Плотный суп с жареной грудинкой.</i>",
+        True,
+    ),
+    (NewDish.portion, "portion", "Порция — вес или количество.\nНапример: <i>700 г</i>, <i>350/100 г</i> или <i>5 шт.</i>", True),
     (NewDish.price, "price_cents", "Цена в евро (например 10 или 10.5):", False),
     (NewDish.photo, "photo_file_id", "Фото блюда:", True),
 ]

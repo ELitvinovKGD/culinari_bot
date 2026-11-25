@@ -21,14 +21,16 @@ import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.methods import (
+    EditMessageText,
     GetChatMember,
     GetMe,
     SendDocument,
     SendMediaGroup,
     TelegramMethod,
 )
-from aiogram.types import CallbackQuery, Chat, ChatMemberAdministrator, Message, Update, User
+from aiogram.types import CallbackQuery, Chat, ChatMemberAdministrator, Message, PhotoSize, Update, User
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -52,9 +54,14 @@ class FakeSession(BaseSession):
     def __init__(self) -> None:
         super().__init__()
         self.calls: list[TelegramMethod] = []
+        # id сообщений-фото: у них нет текста, и Telegram не даёт делать им edit_text.
+        self.photo_message_ids: set[int] = set()
 
     async def make_request(self, bot, method, timeout=None):
         self.calls.append(method)
+        # Ведём себя как настоящий Telegram: edit_text у фото — ошибка.
+        if isinstance(method, EditMessageText) and method.message_id in self.photo_message_ids:
+            raise TelegramBadRequest(method=method, message="Bad Request: there is no text in the message to edit")
         if isinstance(method, GetMe):
             return User(id=BOT_ID, is_bot=True, first_name="Bot", username="test_bot")
         if isinstance(method, GetChatMember):
@@ -89,14 +96,16 @@ class FakeSession(BaseSession):
         return out
 
 
-def fake_message(chat_id, text: str = "", user_id: int | None = None) -> Message:
+def fake_message(chat_id, text: str = "", user_id: int | None = None, photo: bool = False) -> Message:
     chat_type = "supergroup" if chat_id and int(chat_id) < 0 else "private"
     return Message(
         message_id=next(_ids),
         date=datetime.now(timezone.utc),
         chat=Chat(id=int(chat_id), type=chat_type),
         from_user=User(id=user_id or BOT_ID, is_bot=user_id is None, first_name="X", username=f"u{user_id}"),
-        text=text or None,
+        text=None if photo else (text or None),
+        photo=[PhotoSize(file_id="ph", file_unique_id="u", width=10, height=10)] if photo else None,
+        caption=text if photo else None,
     )
 
 
@@ -110,12 +119,16 @@ class Harness:
         msg = fake_message(chat_id or user_id, text, user_id)
         await self.dp.feed_update(self.bot, Update(update_id=next(_ids), message=msg))
 
-    async def click(self, user_id: int, data) -> None:
+    async def click(self, user_id: int, data, photo: bool = False) -> None:
+        """Нажатие кнопки. photo=True — кнопка под сообщением-фото (как у карточки блюда)."""
+        message = fake_message(user_id, photo=photo)
+        if photo:
+            self.fake.photo_message_ids.add(message.message_id)
         cb = CallbackQuery(
             id=str(next(_ids)),
             from_user=User(id=user_id, is_bot=False, first_name="X", username=f"u{user_id}"),
             chat_instance="ci",
-            message=fake_message(user_id),
+            message=message,
             data=data.pack(),
         )
         await self.dp.feed_update(self.bot, Update(update_id=next(_ids), callback_query=cb))
@@ -342,6 +355,8 @@ async def test_admin_tools(harness):
     async with h.maker() as s:
         assert await admin_service.get_admin(s, 78) is None
 
-    # Экраны админки открываются без ошибок.
+    # Экраны админки открываются без ошибок — в том числе по кнопке
+    # под фото (регрессия: «← Каталог» под карточкой блюда с фото падал).
     for section in ("home", "issues", "archive", "catalog", "archived", "settings", "admins", "notify"):
         await h.click(OWNER, AdmCb(section=section))
+        await h.click(OWNER, AdmCb(section=section), photo=True)

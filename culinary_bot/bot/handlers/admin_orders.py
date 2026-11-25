@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from culinary_bot import texts
 from culinary_bot.bot import keyboards, publisher
 from culinary_bot.bot.callbacks import AOrderCb
+from culinary_bot.bot.ui import replace_message
 from culinary_bot.db.models import Order
 from culinary_bot.services import ServiceError
 from culinary_bot.services import orders as order_service
@@ -42,7 +43,7 @@ async def cb_order(callback: CallbackQuery, callback_data: AOrderCb, state: FSMC
 
         elif action == "delivered":
             order_service.mark_delivered(order)
-            await callback.message.edit_text(texts.order_for_admin(order), reply_markup=keyboards.admin_order(order))
+            await replace_message(callback, texts.order_for_admin(order), reply_markup=keyboards.admin_order(order))
 
         elif action == "cancel":
             await callback.message.edit_reply_markup(
@@ -55,7 +56,7 @@ async def cb_order(callback: CallbackQuery, callback_data: AOrderCb, state: FSMC
 
         elif action == "cancel_yes":
             await order_service.cancel_order(session, order, by="admin")
-            await callback.message.edit_text(texts.order_for_admin(order), reply_markup=keyboards.admin_order(order))
+            await replace_message(callback, texts.order_for_admin(order), reply_markup=keyboards.admin_order(order))
             await publisher.send_safe(bot, order.customer.tg_id, texts.cancelled_by_admin(order))
             await publisher.delete_order_post(bot, session, order)
 
@@ -68,7 +69,7 @@ async def cb_order(callback: CallbackQuery, callback_data: AOrderCb, state: FSMC
 
         elif action == "del_extra":
             await order_service.remove_extra_item(session, order, callback_data.extra_id)
-            await callback.message.edit_text(texts.order_for_admin(order), reply_markup=keyboards.admin_order(order))
+            await replace_message(callback, texts.order_for_admin(order), reply_markup=keyboards.admin_order(order))
 
     except ServiceError as error:
         await callback.answer(str(error), show_alert=True)
