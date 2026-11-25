@@ -55,7 +55,7 @@ def main_menu(is_admin: bool) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
-def card(index: int, total: int, item: IssueItem, qty: int, cart_text: str) -> InlineKeyboardMarkup:
+def card(index: int, total: int, item: IssueItem, qty: int, cart_text: str, stock_link: bool = False) -> InlineKeyboardMarkup:
     """
     Кнопки под карточкой блюда в карусели:
 
@@ -77,6 +77,9 @@ def card(index: int, total: int, item: IssueItem, qty: int, cart_text: str) -> I
         sizes.append(1)
     kb.button(text=cart_text, callback_data=CheckoutCb(action="list"))
     sizes.append(1)
+    if stock_link:
+        kb.button(text="🧺 Ещё вне лавки →", callback_data=StockCb(action="open"))
+        sizes.append(1)
     kb.adjust(*sizes)
     return kb.as_markup()
 
@@ -89,7 +92,11 @@ def hide_message(index: int) -> InlineKeyboardMarkup:
 
 
 def list_view(
-    items: list[IssueItem], qty: dict[int, int], total_text: str, in_order: dict[int, int] | None = None
+    items: list[IssueItem],
+    qty: dict[int, int],
+    total_text: str,
+    in_order: dict[int, int] | None = None,
+    stock_link: bool = False,
 ) -> InlineKeyboardMarkup:
     """
     Полный список блюд: в каждой строке название с ценой и −/количество/+.
@@ -115,6 +122,8 @@ def list_view(
             InlineKeyboardButton(text="+", callback_data=ListCb(action="plus", item_id=item.id).pack()),
         )
     kb.row(InlineKeyboardButton(text=f"Дальше → {total_text}", callback_data=ListCb(action="next").pack()))
+    if stock_link:
+        kb.row(InlineKeyboardButton(text="🧺 Ещё вне лавки →", callback_data=StockCb(action="open").pack()))
     return kb.as_markup()
 
 
@@ -127,7 +136,7 @@ def where_to_add(has_own: bool, gifts: list[tuple[int, str]]) -> InlineKeyboardM
         kb.button(text="✅ Новый заказ себе", callback_data=CheckoutCb(action="confirm"))
     for rid, name in gifts:
         kb.button(text=f"➕ К заказу получателю: {name}", callback_data=CheckoutCb(action="pick_to", rid=rid))
-    kb.button(text="🎁 Новому получателю", callback_data=CheckoutCb(action="gift"))
+    kb.button(text="🎁 Другому получателю", callback_data=CheckoutCb(action="gift"))
     kb.button(text="✏️ Изменить корзину", callback_data=CheckoutCb(action="list"))
     kb.adjust(1)
     return kb.as_markup()
@@ -581,7 +590,7 @@ def setup_start() -> InlineKeyboardMarkup:
 # ---------------------------------------------------------------------------
 
 
-def stock_list(items: list[IssueItem], qty: dict[int, int], total_text: str) -> InlineKeyboardMarkup:
+def stock_list(items: list[IssueItem], qty: dict[int, int], total_text: str, lavka_link: bool = False) -> InlineKeyboardMarkup:
     """Список блюд вне лавки: название · цена · остаток, и −/количество/+."""
     kb = InlineKeyboardBuilder()
     for item in items:
@@ -598,6 +607,8 @@ def stock_list(items: list[IssueItem], qty: dict[int, int], total_text: str) -> 
             InlineKeyboardButton(text="+", callback_data=StockCb(action="plus", item_id=item.id).pack()),
         )
     kb.row(InlineKeyboardButton(text=f"🛒 Оформить → {total_text}", callback_data=StockCb(action="checkout").pack()))
+    if lavka_link:
+        kb.row(InlineKeyboardButton(text="🍽 Меню лавки →", callback_data=CardCb(action="show", index=0).pack()))
     return kb.as_markup()
 
 
@@ -608,13 +619,29 @@ def stock_card_back() -> InlineKeyboardMarkup:
 
 
 def stock_where(orders: list[Order]) -> InlineKeyboardMarkup:
-    """Куда добавить блюда вне лавки: к одному из заказов в лавке или отдельно."""
+    """
+    «Куда добавить?» для блюд вне лавки (решение от 26.11): к своему заказу
+    в лавке, к заказу получателя или «🎁 Другому получателю». Всё едет с лавкой.
+    Если заказы в разных лавках (одна закрыта, другая открыта) — в подписи лавка.
+    """
+    several = len({o.issue_id for o in orders}) > 1
     kb = InlineKeyboardBuilder()
     for o in orders:
-        who = f"получателю {o.name}" if o.is_gift else "в"
-        label = f"➕ К заказу {who} «{o.issue.title}»" if o.is_gift else f"➕ К заказу в «{o.issue.title}»"
-        kb.button(text=label[:60], callback_data=StockCb(action="to", order_id=o.id))
-    kb.button(text="📦 Отдельный заказ", callback_data=StockCb(action="separate"))
+        label = f"➕ К заказу получателю: {o.name}" if o.is_gift else "➕ К моему заказу"
+        if several:
+            label += f" («{o.issue.title}»)"
+        kb.button(text=label[:60], callback_data=StockCb(action="pick", order_id=o.id))
+    kb.button(text="🎁 Другому получателю", callback_data=StockCb(action="gift"))
+    kb.button(text="← Изменить корзину", callback_data=StockCb(action="list"))
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def stock_add_confirm(order_id: int) -> InlineKeyboardMarkup:
+    """После выбора заказа: итог по нему и «✅ Завершить заказ»."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Завершить заказ", callback_data=StockCb(action="to", order_id=order_id))
+    kb.button(text="← Куда добавить", callback_data=StockCb(action="checkout"))
     kb.adjust(1)
     return kb.as_markup()
 

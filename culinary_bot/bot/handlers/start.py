@@ -67,7 +67,7 @@ async def cmd_start(
         await client_stock.show_stock(message, session, customer)
 
 
-@router.message(F.text == texts.BTN_MENU)
+@router.message(F.text.in_({texts.BTN_MENU, texts.OLD_BTN_MENU}))
 @router.message(Command("menu"))
 async def btn_menu(message: Message, state: FSMContext, session: AsyncSession, customer: Customer) -> None:
     """Кнопка «🍽 Меню» — показать карусель текущего выпуска."""

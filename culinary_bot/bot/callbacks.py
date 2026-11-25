@@ -187,9 +187,10 @@ class ProfileCb(CallbackData, prefix="prof"):
 
 class StockCb(CallbackData, prefix="stk"):
     """
-    «🧺 В наличии» у клиента: open (показать список), plus, minus, card (карточка
-    блюда), list (вернуться к списку), checkout (оформить), to (добавить к заказу
-    order_id в лавке), separate (отдельный заказ), noop.
+    «🧺 Вне лавки» у клиента: open (показать список), plus, minus, card (карточка
+    блюда), list (вернуться к списку), checkout (оформить), pick (выбран заказ
+    в лавке order_id — показать итог), to (добавить к нему), gift (другому
+    получателю), noop.
     """
 
     action: str

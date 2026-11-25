@@ -92,6 +92,11 @@ async def list_finished_issues(session: AsyncSession, limit: int = 10) -> list[I
 STOCK_TITLE = "Блюда вне лавки"
 
 
+async def find_stock_issue(session: AsyncSession) -> Issue | None:
+    """Выпуск «Блюда вне лавки», если он уже есть (не создаёт — для проверок «есть ли что-то»)."""
+    return await session.scalar(select(Issue).where(Issue.kind == IssueKind.STOCK))
+
+
 async def get_stock_issue(session: AsyncSession) -> Issue:
     """Постоянный выпуск «Блюда вне лавки»; создаётся при первом обращении."""
     issue = await session.scalar(select(Issue).where(Issue.kind == IssueKind.STOCK))

@@ -5,7 +5,7 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from culinary_bot.db.models import (
@@ -111,15 +111,25 @@ async def place_order(
 
 
 async def place_stock_order(
-    session: AsyncSession, customer: Customer, stock: Issue, comment: str | None, base: Order | None = None
+    session: AsyncSession,
+    customer: Customer,
+    stock: Issue,
+    comment: str | None,
+    base: Order | None = None,
+    recipient: Recipient | None = None,
+    payer: str | None = None,
+    lavka: Issue | None = None,
 ) -> Order:
     """
-    Оформить заказ «🧺 В наличии» из корзины блюд вне лавки (решение от 26.11).
+    Оформить заказ «🧺 Вне лавки» из корзины блюд вне лавки (решения от 26.11).
 
-    base — заказ в лавке, к которому добавить (лавка открыта или ещё не
-    развезена): тогда новая часть записывается в ТУ лавку — шеф увидит её
-    в таблице лавки строками «🧺» и отвезёт вместе. Без base — отдельный
-    заказ в выпуске «Блюда вне лавки»: шеф отдаст, когда будет готов.
+    Куда попадает заказ:
+    - base — добавка к заказу в лавке (себе или получателю): та же лавка,
+      те же контакты; шеф видит строки «🧺» в таблице лавки и везёт вместе;
+    - lavka + recipient — НОВЫЙ заказ другому получателю в составе лавки
+      (у клиента есть заказ в лавке, а капусту он дарит Маше — едет с лавкой);
+    - иначе — отдельный заказ в выпуске «Блюда вне лавки» (себе или получателю):
+      шеф отдаст, когда будет готов.
     Бронь в корзине уже держит остаток — здесь он не меняется.
     """
     cart = await cart_service.get_cart(session, customer, stock)
@@ -129,12 +139,22 @@ async def place_stock_order(
         if base.customer_id != customer.id or base.status != OrderStatus.ACCEPTED:
             raise ServiceError("К этому заказу уже нельзя добавить.")
         if base.issue.status not in (IssueStatus.OPEN, IssueStatus.CLOSED):
-            raise ServiceError("Эта лавка уже развезена — оформите отдельный заказ.")
+            raise ServiceError("Эта лавка уже развезена — оформите заказ заново.")
         source, issue_id = base, base.issue_id
+        recipient_id, payer = base.recipient_id, base.payer
+        delivery_type = base.delivery_type
     else:
-        if not customer.has_saved_data():
-            raise ServiceError("Не заполнены контактные данные.")
-        source, issue_id = customer, stock.id
+        if lavka is not None and lavka.status not in (IssueStatus.OPEN, IssueStatus.CLOSED):
+            raise ServiceError("Эта лавка уже развезена.")
+        issue_id = lavka.id if lavka is not None else stock.id
+        if recipient is not None:
+            source, recipient_id = recipient, recipient.id
+            delivery_type = DeliveryType.DELIVERY  # заказ другому человеку — всегда доставка
+        else:
+            if not customer.has_saved_data():
+                raise ServiceError("Не заполнены контактные данные.")
+            source, recipient_id, payer = customer, None, None
+            delivery_type = customer.delivery_type
     order = Order(
         issue_id=issue_id,
         customer_id=customer.id,
@@ -142,12 +162,12 @@ async def place_stock_order(
         name=source.name,
         phone=source.phone,
         username=customer.username,
-        delivery_type=source.delivery_type,
+        delivery_type=delivery_type,
         address=source.address,
         latitude=source.latitude,
         longitude=source.longitude,
-        recipient_id=base.recipient_id if base else None,
-        payer=base.payer if base else None,
+        recipient_id=recipient_id,
+        payer=payer,
         comment=(comment or "").strip() or None,
         items=[
             OrderItem(
@@ -164,6 +184,14 @@ async def place_stock_order(
     await cart_service.clear_cart(session, customer, stock)
     await session.flush()
     return order
+
+
+async def pending_stock_count(session: AsyncSession, stock: Issue) -> int:
+    """Сколько заказов вне лавки ещё не отдано (для напоминаний шефу)."""
+    count = await session.scalar(
+        select(func.count()).select_from(Order).where(Order.issue_id == stock.id, Order.status == OrderStatus.ACCEPTED)
+    )
+    return count or 0
 
 
 async def attachable_orders(session: AsyncSession, customer: Customer) -> list[Order]:

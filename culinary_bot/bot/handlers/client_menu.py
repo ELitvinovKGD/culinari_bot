@@ -38,6 +38,12 @@ async def current_issue_or_none(session: AsyncSession) -> Issue | None:
     return await issue_service.get_open_issue(session)
 
 
+async def has_stock(session: AsyncSession) -> bool:
+    """Есть ли что-то «🧺 Вне лавки» — тогда в меню лавки кнопка-переход туда."""
+    stock = await issue_service.find_stock_issue(session)
+    return stock is not None and bool(issue_service.stock_available(stock))
+
+
 async def existing_orders(session: AsyncSession, customer: Customer, issue: Issue) -> list[CustomerSummary]:
     """Все оформленные заказы клиента в этом выпуске: себе и получателям (по сводке на каждый)."""
     parts = await order_service.customer_issue_orders(session, customer, issue)
@@ -73,7 +79,8 @@ async def card_view(session: AsyncSession, customer: Customer, issue: Issue, ind
     existing = await existing_order(session, customer, issue)
     in_order = existing.menu_quantities.get(item.id, 0) if existing else 0
     text = texts.card_text(item, index, len(items), in_order)
-    return text, keyboards.card(index, len(items), item, qty, cart_text), item.photo_file_id
+    stock_link = await has_stock(session)
+    return text, keyboards.card(index, len(items), item, qty, cart_text, stock_link), item.photo_file_id
 
 
 async def list_view(session: AsyncSession, customer: Customer, issue: Issue):
@@ -83,7 +90,8 @@ async def list_view(session: AsyncSession, customer: Customer, issue: Issue):
     total = cart_service.cart_total_cents(cart)
     existing = await existing_order(session, customer, issue)
     in_order = existing.menu_quantities if existing else None
-    return texts.list_view_text(issue), keyboards.list_view(items, cart_service.quantities(cart), format_price(total), in_order)
+    kb = keyboards.list_view(items, cart_service.quantities(cart), format_price(total), in_order, await has_stock(session))
+    return texts.list_view_text(issue), kb
 
 
 async def show_menu(message: Message, session: AsyncSession, customer: Customer) -> None:

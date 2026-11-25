@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 from culinary_bot.config import settings
-from culinary_bot.db.models import CartItem, DeliveryType, Issue, IssueItem, IssueStatus, Order, OrderStatus
+from culinary_bot.db.models import CartItem, DeliveryType, Issue, IssueItem, IssueKind, IssueStatus, Order, OrderStatus
 from culinary_bot.services.money import format_price
 from culinary_bot.services.orders import CustomerSummary
 
@@ -61,12 +61,16 @@ def order_label(order: Order) -> str:
 # Общие фразы
 # ---------------------------------------------------------------------------
 
-BTN_MENU = "🍽 Меню"
+BTN_MENU = "🍽 Меню лавки"
+# Старые подписи кнопок: у клиентов на телефонах может остаться прежняя
+# клавиатура — нажатие должно работать, пока Telegram её не обновит.
+OLD_BTN_MENU = "🍽 Меню"
+OLD_BTN_STOCK = "🧺 В наличии"
 BTN_MY_ORDERS = "🧾 Мои заказы"
 BTN_ADMIN = "⚙️ Админка"
 BTN_WRITE_CHEF = "✉️ Написать шефу"
 BTN_MY_DATA = "👤 Мои данные"
-BTN_STOCK = "🧺 В наличии"
+BTN_STOCK = "🧺 Вне лавки"
 STOCK_EMPTY = "У шефа всё разобрали. Загляните позже 🙂"
 NO_CHEF_CONTACT = "Шеф пока не указал контакт. Напишите ему в группе."
 
@@ -387,7 +391,8 @@ def new_order_notification(order: Order, *, excel_outdated: bool) -> str:
     excel_outdated — таблицу по выпуску уже скачивали, она устарела.
     Добавка к существующему заказу — см. order_change_notification.
     """
-    text = "🆕 " + order_for_admin(order, "Новый заказ")
+    title = "Новый заказ вне лавки" if order.issue.kind == IssueKind.STOCK else "Новый заказ"
+    text = "🆕 " + order_for_admin(order, title)
     if excel_outdated:
         text += "\n\n⚠️ Таблица изменилась — пересоберите «📊 Excel», если уже распечатали."
     return text
@@ -560,13 +565,27 @@ def cancelled_by_admin(order: Order) -> str:
 # ---------------------------------------------------------------------------
 
 
-def stock_view_text(issue: Issue, hold_minutes: int) -> str:
-    """Шапка экрана «🧺 В наличии» у клиента."""
+def stock_pending_reminder(count: int) -> str:
+    """Напоминание шефу после объявления выдачи по лавке."""
+    return f"⚠️ Ещё {count} заказ(ов) вне лавки — это сообщение им не пришло."
+
+
+def stock_view_text(issue: Issue, hold_minutes: int, lavka_title: str | None) -> str:
+    """
+    Шапка экрана «🧺 Вне лавки» у клиента.
+
+    lavka_title — у клиента есть заказ в лавке (ещё не развезённой): тогда
+    подсказываем, что можно добавить к нему и получить вместе. Иначе —
+    шеф напишет, когда будет готово (решение от 26.11).
+    """
     header = f"{esc(issue.header)}\n\n" if issue.header else ""
+    if lavka_title:
+        delivery = f"Можно добавить к вашему заказу в «{esc(lavka_title)}» — приедет вместе с ним."
+    else:
+        delivery = "Шеф напишет, когда будет готово к выдаче."
     return (
-        f"🧺 <b>В наличии у шефа</b>\n\n{header}"
-        f"Выберите количество. Корзина бронирует порции на {hold_minutes} мин.\n"
-        "Название — открыть карточку с фото."
+        f"🧺 <b>Вне лавки — есть у шефа</b>\n\n{header}{delivery}\n\n"
+        f"Корзина бронирует порции на {hold_minutes} мин. Название — открыть карточку с фото."
     )
 
 
@@ -576,10 +595,11 @@ def stock_item_card(item: IssueItem) -> str:
     return f"{item_block(item)}\nОсталось: {item.stock_left}{composition}"
 
 
-def stock_where_text() -> str:
+def stock_where_text(cart: list[CartItem], total_cents: int) -> str:
+    """«Куда добавить?» для блюд вне лавки, когда у клиента есть заказ в лавке."""
     return (
-        "У вас есть заказ в лавке. Добавить к нему — тогда шеф привезёт всё вместе?\n"
-        "Или оформить отдельно — шеф отдаст, когда будет готов."
+        f"<b>Добавляете:</b>\n{cart_lines(cart)}\n\nНа сумму {format_price(total_cents)}.\n\n"
+        "<b>Куда добавить?</b> Всё приедет вместе с доставкой лавки."
     )
 
 
@@ -587,7 +607,7 @@ def stock_offer(items: list[IssueItem]) -> str:
     """Предложение после заказа из лавки: «Ещё у шефа в наличии: …»."""
     names = ", ".join(esc(item.name) for item in items[:5])
     more = " и другое" if len(items) > 5 else ""
-    return f"🧺 Ещё у шефа в наличии: {names}{more}."
+    return f"🧺 Ещё у шефа вне лавки: {names}{more}."
 
 
 def stock_for_admin(issue: Issue, pending: int) -> str:

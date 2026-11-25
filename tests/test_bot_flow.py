@@ -650,7 +650,7 @@ async def test_stock_flow(harness):
     await h.click(OWNER, DishCb(action="skip"))
     await h.send(OWNER, "/connect", chat_id=GROUP)
 
-    # Пусто — «всё разобрали».
+    # Пусто — «всё разобрали» (старая подпись кнопки тоже работает).
     await h.send(CLIENT, "🧺 В наличии")
     assert "всё разобрали" in h.fake.texts()[-1]
 
@@ -707,15 +707,31 @@ async def test_stock_flow(harness):
     await h.click(3, CheckoutCb(action="skip"))
     await h.click(3, StockCb(action="plus", item_id=item.id))
     await h.click(3, StockCb(action="checkout"))
-    assert "Добавить к нему" in h.fake.texts()[-1]
+    assert "Куда добавить" in h.fake.texts()[-1] and "вместе с доставкой лавки" in h.fake.texts()[-1]
     async with h.maker() as s:
         ivan_order = await s.scalar(select(Order).where(Order.issue_id == lavka.id))
+    await h.click(3, StockCb(action="pick", order_id=ivan_order.id))
+    assert "Уже заказано" in h.fake.texts()[-1]
     await h.click(3, StockCb(action="to", order_id=ivan_order.id))
     await h.click(3, CheckoutCb(action="skip"))
     assert "Добавлено к заказу" in h.fake.texts()[-1]
+    # Чужой заказ выбрать нельзя.
+    await h.click(CLIENT, StockCb(action="pick", order_id=ivan_order.id))
+    assert any("уже нельзя добавить" in (getattr(c, "text", "") or "") for c in h.fake.calls[-2:])
     async with h.maker() as s:
         parts = list(await s.scalars(select(Order).where(Order.issue_id == lavka.id)))
         assert len(parts) == 2 and (await s.get(IssueItem, item.id)).stock_left == 0
+
+    # Главный экран админки напоминает о неотданных заказах вне лавки.
+    await h.send(OWNER, "/admin")
+    assert any("Вне лавки: 1 заказ" in t for t in h.fake.texts()[-3:])
+
+    # Объявление выдачи по лавке → напоминание о заказах вне лавки.
+    await h.click(OWNER, IssueCb(action="close_yes", issue_id=lavka.id))
+    await h.click(OWNER, IssueCb(action="announce", issue_id=lavka.id))
+    await h.send(OWNER, "Забрать в среду")
+    await h.click(OWNER, IssueCb(action="announce_yes", issue_id=lavka.id))
+    assert any("заказ(ов) вне лавки — это сообщение им не пришло" in t for t in h.fake.texts())
 
     # Шеф: сообщить всем с заказами вне лавки и отметить отданными.
     await h.click(OWNER, IssueCb(action="stock_notify", issue_id=stock.id))
@@ -725,3 +741,54 @@ async def test_stock_flow(harness):
     await h.click(OWNER, IssueCb(action="stock_done_yes", issue_id=stock.id))
     async with h.maker() as s:
         assert (await s.get(Order, order.id)).status == OrderStatus.DELIVERED
+
+
+
+async def test_stock_gift_goes_with_lavka(harness):
+    """«🎁 Другому получателю» из «Вне лавки» при заказе в лавке — новый заказ получателю в лавке."""
+    from culinary_bot.bot.callbacks import StockCb
+    from culinary_bot.db.models import IssueKind
+    from culinary_bot.services import cart as cart_service
+    from culinary_bot.services import catalog as catalog_service
+    from culinary_bot.services import customers as customer_service
+    from culinary_bot.services import issues as issue_service
+    from culinary_bot.services import orders as order_service
+
+    h = harness
+    async with h.maker() as s:
+        soup = await catalog_service.create_dish(s, name="Суп", price_cents=1000)
+        jam = await catalog_service.create_dish(s, name="Варенье", price_cents=500)
+        lavka = await issue_service.create_draft(s, "Лавка")
+        await issue_service.add_dish_to_issue(s, lavka, soup)
+        await issue_service.open_issue(s, lavka)
+        stock = await issue_service.get_stock_issue(s)
+        jam_item = await issue_service.add_stock_dish(s, stock, jam, 5)
+        eva = await customer_service.get_or_create(s, CLIENT, "eva")
+        customer_service.save_contact(eva, name="Ева", phone="555123456", delivery_type="delivery", address="Будва 1")
+        eva.privacy_accepted = True
+        await cart_service.change_quantity(s, eva, lavka.items[0], +1)
+        await order_service.place_order(s, eva, lavka, comment=None)
+        await s.commit()
+        jam_id, lavka_id = jam_item.id, lavka.id
+
+    # В меню лавки есть переход «🧺 Ещё вне лавки».
+    await h.send(CLIENT, "🍽 Меню лавки")
+    labels = [b.text for row in h.fake.calls[-1].reply_markup.inline_keyboard for b in row]
+    assert "🧺 Ещё вне лавки →" in labels
+
+    await h.click(CLIENT, StockCb(action="open"))
+    assert "приедет вместе с ним" in h.fake.texts()[-1]
+    await h.click(CLIENT, StockCb(action="plus", item_id=jam_id))
+    await h.click(CLIENT, StockCb(action="checkout"))
+    await h.click(CLIENT, StockCb(action="gift"))
+    await h.send(CLIENT, "Маша")
+    await h.send(CLIENT, "+382 67 111 222")
+    await h.send(CLIENT, "Котор 5")
+    await h.click(CLIENT, CheckoutCb(action="skip_point"))
+    await h.click(CLIENT, CheckoutCb(action="payer_me"))
+    await h.click(CLIENT, CheckoutCb(action="skip"))
+    assert "Приедет вместе с доставкой лавки" in h.fake.texts()[-1]
+    async with h.maker() as s:
+        gift = (await s.scalars(select(Order).order_by(Order.id.desc()))).first()
+        assert gift.issue_id == lavka_id and gift.recipient_id is not None
+        assert gift.issue.kind == IssueKind.LAVKA

@@ -611,6 +611,14 @@ async def cb_announce_yes(
     if failed:
         report += "\n\nНе доставлено (бот заблокирован) — свяжитесь вручную:\n" + "\n".join(failed)
     await callback.message.answer(report)
+    # Напоминание: заказы вне лавки в эту рассылку не попали (решение от 26.11).
+    stock = await issue_service.find_stock_issue(session)
+    pending = await order_service.pending_stock_count(session, stock) if stock else 0
+    if pending:
+        await callback.message.answer(
+            texts.stock_pending_reminder(pending),
+            reply_markup=keyboards.setup_buttons(("📣 Написать им", IssueCb(action="stock_notify", issue_id=stock.id))),
+        )
     await send_issue(callback.message, session, issue)
     await callback.answer()
 

@@ -37,7 +37,7 @@ from culinary_bot.bot import keyboards
 from culinary_bot.bot.callbacks import CheckoutCb
 from culinary_bot.bot.handlers import client_orders
 from culinary_bot.config import settings
-from culinary_bot.db.models import Customer, DeliveryType, PayerType
+from culinary_bot.db.models import Customer, DeliveryType, IssueKind, PayerType
 from culinary_bot.services import ServiceError, geocode
 from culinary_bot.services import customers as customer_service
 from culinary_bot.services import issues as issue_service
@@ -47,6 +47,16 @@ from culinary_bot.services import settings as settings_service
 from culinary_bot.services.money import format_price
 
 router = Router(name="client_checkout")
+
+# Цели оформления (ключ "target" в данных FSM):
+#   own            — заказ себе в лавке;          gift — получателю в лавке;
+#   add            — добавка к заказу в лавке;
+#   stock          — блюда вне лавки → к заказу в лавке (stock_base);
+#   stock_gift     — блюда вне лавки → новому получателю, едет с лавкой (stock_lavka);
+#   stock_sep      — блюда вне лавки отдельным заказом себе;
+#   stock_sep_gift — блюда вне лавки отдельным заказом получателю.
+GIFT_TARGETS = {"gift", "stock_gift", "stock_sep_gift"}
+STOCK_TARGETS = {"stock", "stock_gift", "stock_sep", "stock_sep_gift"}
 
 
 class Checkout(StatesGroup):
@@ -100,10 +110,10 @@ async def cb_privacy(callback: CallbackQuery, state: FSMContext, session: AsyncS
     customer.privacy_accepted = True
     await callback.message.edit_reply_markup(reply_markup=None)
     data = await state.get_data()
-    if data.get("target") == "gift":
+    if data.get("target") in GIFT_TARGETS:
         await ask_recipient(callback.message, state, session, customer)
     else:
-        await ask_contact_or_saved(callback.message, state, customer, allow_gift=data.get("target") != "stock_sep")
+        await ask_contact_or_saved(callback.message, state, customer)
     await callback.answer()
 
 
@@ -117,7 +127,7 @@ async def start_stock_separate(message: Message, state: FSMContext, customer: Cu
     if not customer.privacy_accepted:
         await message.answer(texts.PRIVACY_NOTICE, reply_markup=keyboards.single("Понятно", "privacy"))
     else:
-        await ask_contact_or_saved(message, state, customer, allow_gift=False)
+        await ask_contact_or_saved(message, state, customer)
 
 
 async def ask_contact_or_saved(message: Message, state: FSMContext, customer: Customer, allow_gift: bool = True) -> None:
@@ -387,13 +397,22 @@ async def finish_contact(message: Message, state: FSMContext, customer: Customer
 async def cb_gift(callback: CallbackQuery, state: FSMContext, session: AsyncSession, customer: Customer) -> None:
     """«🎁 Другому получателю» — выбрать из записной книжки или добавить нового."""
     await callback.message.edit_reply_markup(reply_markup=None)
-    await state.clear()
-    await state.update_data(target="gift")
-    if not customer.privacy_accepted:
-        await callback.message.answer(texts.PRIVACY_NOTICE, reply_markup=keyboards.single("Понятно", "privacy"))
-    else:
-        await ask_recipient(callback.message, state, session, customer)
+    # Пришли из отдельного заказа вне лавки — подарок тоже будет вне лавки.
+    previous = (await state.get_data()).get("target")
+    await start_gift(callback.message, state, session, customer, "stock_sep_gift" if previous == "stock_sep" else "gift")
     await callback.answer()
+
+
+async def start_gift(
+    message: Message, state: FSMContext, session: AsyncSession, customer: Customer, target: str, **extra
+) -> None:
+    """Начать оформление получателю (target — из GIFT_TARGETS, extra — например stock_lavka)."""
+    await state.clear()
+    await state.update_data(target=target, **extra)
+    if not customer.privacy_accepted:
+        await message.answer(texts.PRIVACY_NOTICE, reply_markup=keyboards.single("Понятно", "privacy"))
+    else:
+        await ask_recipient(message, state, session, customer)
 
 
 async def ask_recipient(message: Message, state: FSMContext, session: AsyncSession, customer: Customer) -> None:
@@ -415,7 +434,7 @@ async def cb_pick_rec(
         await callback.answer(str(error), show_alert=True)
         return
     await callback.message.edit_reply_markup(reply_markup=None)
-    await state.update_data(target="gift", recipient_id=recipient.id)
+    await state.update_data(recipient_id=recipient.id)
     await ask_payer(callback.message)
     await callback.answer()
 
@@ -428,7 +447,7 @@ async def cb_new_rec(callback: CallbackQuery, state: FSMContext) -> None:
 
 
 async def start_recipient_input(message: Message, state: FSMContext) -> None:
-    await state.update_data(target="gift", mode="rec")
+    await state.update_data(mode="rec")
     await state.set_state(Checkout.rec_name)
     await message.answer(texts.ASK_REC_NAME)
 
@@ -527,7 +546,7 @@ async def place(message: Message, state: FSMContext, session: AsyncSession, cust
     data = await state.get_data()
     await state.clear()
     target = data.get("target", "own")
-    if target in ("stock", "stock_sep"):
+    if target in STOCK_TARGETS:
         await place_stock(message, session, customer, data, comment)
         return
 
@@ -582,35 +601,52 @@ async def place(message: Message, state: FSMContext, session: AsyncSession, cust
 
 
 async def place_stock(message: Message, session: AsyncSession, customer: Customer, data: dict, comment: str | None) -> None:
-    """Оформить «🧺 В наличии»: к заказу в лавке (stock_base) или отдельно."""
+    """
+    Оформить «🧺 Вне лавки» по цели из данных FSM (см. STOCK_TARGETS):
+    к заказу в лавке, новому получателю с лавкой или отдельным заказом.
+    """
     stock = await issue_service.get_stock_issue(session)
-    base = None
-    if data.get("target") == "stock":
-        try:
-            base = await order_service.get_order(session, data["stock_base"])
-        except (ServiceError, KeyError):
-            await message.answer(texts.SOMETHING_WRONG)
-            return
+    target = data.get("target")
+    base = recipient = lavka = None
+    payer = data.get("payer")
     try:
-        order = await order_service.place_stock_order(session, customer, stock, comment, base=base)
+        if target == "stock":
+            base = await order_service.get_order(session, data["stock_base"])
+        if target in ("stock_gift", "stock_sep_gift"):
+            recipient = await recipient_service.get_recipient(session, customer, data["recipient_id"])
+        if target == "stock_gift":
+            lavka = await issue_service.get_issue(session, data["stock_lavka"])
+        order = await order_service.place_stock_order(
+            session, customer, stock, comment, base=base, recipient=recipient, payer=payer, lavka=lavka
+        )
+    except KeyError:
+        await message.answer(texts.SOMETHING_WRONG)
+        return
     except ServiceError as error:
         await message.answer(str(error))
         return
+
     kb = await client_orders.order_keyboard(session, order)
+    parts = [
+        o
+        for o in await order_service.customer_issue_orders(session, customer, order.issue)
+        if o.recipient_id == order.recipient_id
+    ]
+    summary = order_service.summarize_by_customer(parts)[0]
     if base is not None:
-        parts = [
-            o
-            for o in await order_service.customer_issue_orders(session, customer, base.issue)
-            if o.recipient_id == base.recipient_id
-        ]
-        summary = order_service.summarize_by_customer(parts)[0]
         await message.answer(texts.order_added(summary), reply_markup=kb)
-    else:
-        await message.answer(
-            f"✅ <b>Заказ принят</b>\n\n{texts.order_lines(order)}\n\nИтого: {format_price(order.total_cents)}\n\n"
-            "Шеф напишет, когда будет готово к выдаче.",
-            reply_markup=kb,
-        )
+        return
+    when = (
+        f"Приедет вместе с доставкой лавки «{texts.esc(order.issue.title)}»."
+        if order.issue.kind != IssueKind.STOCK
+        else "Шеф напишет, когда будет готово к выдаче."
+    )
+    title = f"🎁 Заказ получателю {texts.esc(order.name)} принят" if order.is_gift else "✅ Заказ принят"
+    await message.answer(
+        f"<b>{title}</b>\n\n{texts.summary_lines(summary)}\n\n"
+        f"Итого: {format_price(summary.total_cents)}{texts.payer_note(summary)}\n\n{when}",
+        reply_markup=kb,
+    )
 
 
 async def offer_stock(message: Message, session: AsyncSession, issue) -> None:
@@ -618,7 +654,9 @@ async def offer_stock(message: Message, session: AsyncSession, issue) -> None:
     После заказа из лавки предложить «🧺 Ещё у шефа в наличии» — только если
     есть блюда вне лавки, которых нет в самой лавке (например, наливка).
     """
-    stock = await issue_service.get_stock_issue(session)
+    stock = await issue_service.find_stock_issue(session)
+    if stock is None:
+        return
     lavka_dishes = {item.dish_id for item in issue.items}
     extra = [item for item in issue_service.stock_available(stock) if item.dish_id not in lavka_dishes]
     if extra:

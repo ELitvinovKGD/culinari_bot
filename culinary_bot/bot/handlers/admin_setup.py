@@ -27,6 +27,8 @@ from culinary_bot.bot import keyboards
 from culinary_bot.bot.callbacks import AdmCb, DishCb, FieldCb, SetupCb
 from culinary_bot.db.models import Dish, Issue
 from culinary_bot.services import ServiceError
+from culinary_bot.services import issues as issue_service
+from culinary_bot.services import orders as order_service
 from culinary_bot.services import settings as settings_service
 
 router = Router(name="admin_setup")
@@ -100,8 +102,18 @@ async def home_view(session: AsyncSession) -> tuple[str, InlineKeyboardMarkup]:
     """
     items = await readiness(session)
     menu = keyboards.admin_home()
+    # Неотданные заказы вне лавки — напоминание, пока они есть (решение от 26.11).
+    stock = await issue_service.find_stock_issue(session)
+    pending = await order_service.pending_stock_count(session, stock) if stock else 0
+    stock_line = f"\n\n🧺 Вне лавки: {pending} заказ(ов) ждут выдачи." if pending else ""
+    stock_rows = (
+        [[InlineKeyboardButton(text="🧺 Открыть заказы вне лавки", callback_data=AdmCb(section="stock").pack())]]
+        if pending
+        else []
+    )
     if all(item.done for item in items):
-        return "<b>Админка</b> · Лавка настроена ✅\nЧто будем делать?", menu
+        text = f"<b>Админка</b> · Лавка настроена ✅{stock_line}\nЧто будем делать?"
+        return text, InlineKeyboardMarkup(inline_keyboard=stock_rows + menu.inline_keyboard)
 
     lines = ["<b>Админка</b>", "", "<b>Готовность лавки</b>"]
     fix_rows: list[list[InlineKeyboardButton]] = []
@@ -112,7 +124,7 @@ async def home_view(session: AsyncSession) -> tuple[str, InlineKeyboardMarkup]:
             fix_rows.append([InlineKeyboardButton(text=item.fix_text, callback_data=item.fix_cb.pack())])
     lines += ["", "⚠️ — обязательно до первого выпуска."]
     # Сначала кнопки «исправить», потом обычное меню админки.
-    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=fix_rows + menu.inline_keyboard)
+    return "\n".join(lines) + stock_line, InlineKeyboardMarkup(inline_keyboard=stock_rows + fix_rows + menu.inline_keyboard)
 
 
 async def is_fresh(session: AsyncSession) -> bool:
