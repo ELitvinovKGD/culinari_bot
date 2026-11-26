@@ -1,6 +1,6 @@
 """
 Выпуски в админке: создание, блюда, публикация, правки, закрытие приёма,
-завершение, Excel, лишние порции (docs/scenarios.md, А2–А3, А7–А10).
+завершение, Excel, дополнительные блюда (docs/scenarios.md, А2–А3, А7–А10).
 """
 
 from aiogram import Bot, F, Router
@@ -12,8 +12,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from culinary_bot import texts
 from culinary_bot.bot import jobs, keyboards, publisher
-from culinary_bot.bot.callbacks import IssueCb, ItemCb, LeftCb
-from culinary_bot.bot.handlers import admin_picker, admin_stock, client_orders
+from culinary_bot.bot.callbacks import ExtraCb, IssueCb, ItemCb, LeftCb
+from culinary_bot.bot.handlers import admin_catalog, admin_picker, admin_stock, client_orders
 from culinary_bot.bot.ui import replace_message
 from culinary_bot.db.models import DeliveryType, Issue, IssueItem, IssueKind, IssueStatus, OrderStatus, utcnow
 from culinary_bot.services import ServiceError
@@ -22,7 +22,7 @@ from culinary_bot.services import export as export_service
 from culinary_bot.services import issues as issue_service
 from culinary_bot.services import orders as order_service
 from culinary_bot.services import settings as settings_service
-from culinary_bot.services.money import format_price
+from culinary_bot.services.money import format_price, parse_price
 
 router = Router(name="admin_issues")
 
@@ -34,10 +34,11 @@ class IssueInput(StatesGroup):
     header = State()  # шапка — спрашиваем сразу после названия
     delivery_text = State()  # объявление выдачи для клиентов с доставкой
     pickup_text = State()  # объявление выдачи для клиентов с самовывозом
+    dish_price = State()  # исправленная цена блюда перед добавлением в выпуск
 
 
 class Leftovers(StatesGroup):
-    """Выбор лишних порций (количество хранится в данных FSM)."""
+    """Выбор дополнительных блюд (количество хранится в данных FSM)."""
 
     choosing = State()
 
@@ -85,9 +86,12 @@ async def after_item_added(message: Message, session: AsyncSession, issue: Issue
             if order.customer.tg_id in notified:
                 continue  # у клиента несколько заказов — уведомляем один раз
             notified.add(order.customer.tg_id)
-            await publisher.send_safe(bot, order.customer.tg_id, texts.item_added(item))
+            await publisher.send_safe(bot, order.customer.tg_id, texts.item_added(item), photo=item.photo_file_id)
+        in_group = await publisher.announce_new_item(bot, session, issue, item)
+        note = "\nВ группе — ответ на пост с фото и «Заказать»." if in_group else ""
         await message.answer(
-            f"Блюдо добавлено. Уведомлено клиентов: {len(notified)}.\nНе забудьте «🔄 Обновить пост в группе»."
+            f"Блюдо добавлено. Уведомлено клиентов: {len(notified)}.{note}\n"
+            "Нажмите «🔄 Обновить пост в группе», чтобы блюдо появилось и в тексте поста."
         )
     await send_issue(message, session, issue)
 
@@ -171,6 +175,63 @@ async def cb_add(callback: CallbackQuery, callback_data: IssueCb, session: Async
         return
     await admin_picker.send_picker(callback.message, session, "lavka", issue.id)
     await callback.answer()
+
+
+@router.callback_query(IssueCb.filter(F.action == "pick_dish"))
+async def cb_pick_dish(callback: CallbackQuery, callback_data: IssueCb, session: AsyncSession) -> None:
+    """
+    Шеф выбрал блюдо для выпуска — показать карточку и спросить «Цена верна?».
+
+    Зачем: цены меняются (продукты подорожали), а в каталоге могла остаться
+    старая. Проверка каждый раз — и карточка в каталоге всегда актуальна.
+    """
+    try:
+        dish = await catalog_service.get_dish(session, callback_data.dish_id)
+    except ServiceError as error:
+        await callback.answer(str(error), show_alert=True)
+        return
+    caption = admin_catalog.dish_caption(dish) + f"\n\nЦена <b>{format_price(dish.price_cents)}</b> — верно?"
+    kb = keyboards.price_check(callback_data.issue_id, dish.id)
+    if dish.photo_file_id:
+        await callback.message.answer_photo(dish.photo_file_id, caption=caption, reply_markup=kb)
+    else:
+        await callback.message.answer(caption, reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(IssueCb.filter(F.action == "fix_price"))
+async def cb_fix_price(callback: CallbackQuery, callback_data: IssueCb, state: FSMContext) -> None:
+    await state.set_state(IssueInput.dish_price)
+    await state.update_data(issue_id=callback_data.issue_id, dish_id=callback_data.dish_id)
+    await callback.message.answer("Новая цена в евро (например 12 или 12.5):\n\n<i>/cancel — отменить</i>")
+    await callback.answer()
+
+
+@router.message(IssueInput.dish_price, F.text)
+async def on_dish_price(message: Message, state: FSMContext, session: AsyncSession) -> None:
+    """Сохранить новую цену В КАТАЛОГЕ и сразу добавить блюдо в выпуск."""
+    if message.text == "/cancel":
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+    try:
+        cents = parse_price(message.text)
+    except ServiceError as error:
+        # Состояние не сбрасываем — шеф просто напишет цену ещё раз.
+        await message.answer(str(error))
+        return
+    data = await state.get_data()
+    await state.clear()
+    try:
+        issue = await issue_service.get_issue(session, data["issue_id"])
+        dish = await catalog_service.get_dish(session, data["dish_id"])
+        catalog_service.update_dish_field(dish, "price_cents", cents)
+        await issue_service.add_dish_to_issue(session, issue, dish)
+    except ServiceError as error:
+        await message.answer(str(error))
+        return
+    await message.answer(f"Цена в каталоге: {format_price(cents)} ✅")
+    await after_item_added(message, session, issue)
 
 
 @router.callback_query(IssueCb.filter(F.action == "add_dish"))
@@ -654,11 +715,45 @@ async def cb_finish(callback: CallbackQuery, callback_data: IssueCb, session: As
         await callback.answer(str(error), show_alert=True)
         return
     await callback.message.answer("📦 Выпуск завершён и перенесён в архив.")
+    # Остались неразобранные дополнительные блюда — решает шеф: он знает сроки хранения.
+    extras = await issue_service.unsold_extras(session, issue)
+    if extras:
+        await callback.message.answer(texts.extras_finish_question(extras), reply_markup=keyboards.extras_finish(issue.id))
+    await callback.answer()
+
+
+@router.callback_query(ExtraCb.filter())
+async def cb_extras_finish(callback: CallbackQuery, callback_data: ExtraCb, session: AsyncSession) -> None:
+    """Оставить вне лавки / убрать неразобранные дополнительные блюда завершённой лавки."""
+    action = callback_data.action
+    if action == "noop":
+        await callback.answer()
+        return
+    issue = await load_issue(callback, session, callback_data.issue_id)
+    if not issue:
+        return
+    extras = await issue_service.unsold_extras(session, issue)
+    if action in ("keep_all", "drop_all"):
+        for item in extras:
+            (issue_service.keep_extra if action == "keep_all" else issue_service.drop_extra)(item)
+        done = "Оставлены вне лавки" if action == "keep_all" else "Убраны из продажи"
+        await replace_message(callback, f"{done}: {len(extras)}.")
+    elif action == "choose":
+        await replace_message(callback, "Что оставить вне лавки?", keyboards.extras_choose(issue.id, extras))
+    elif action in ("keep", "drop"):
+        item = next((i for i in extras if i.id == callback_data.item_id), None)
+        if item is not None:
+            (issue_service.keep_extra if action == "keep" else issue_service.drop_extra)(item)
+        left = [i for i in extras if i.id != callback_data.item_id]
+        if left:
+            await callback.message.edit_reply_markup(reply_markup=keyboards.extras_choose(issue.id, left))
+        else:
+            await replace_message(callback, "Готово ✅ Оставленные — в «🧺 Блюда вне лавки».")
     await callback.answer()
 
 
 # ---------------------------------------------------------------------------
-# Лишние порции (А10)
+# Дополнительные блюда (А10, бывшие «лишние порции»; решение от 26.11)
 # ---------------------------------------------------------------------------
 
 
@@ -671,6 +766,10 @@ async def cb_leftovers(callback: CallbackQuery, callback_data: IssueCb, state: F
     issue = await load_issue(callback, session, callback_data.issue_id)
     if not issue:
         return
+    if issue.status != IssueStatus.CLOSED:
+        # Пока приём открыт, клиент закажет прямо из лавки — дополнительные не нужны.
+        await callback.answer("Дополнительные блюда — после закрытия приёма.", show_alert=True)
+        return
     qty: dict[str, int] = {}
     if callback_data.action == "leftovers_from":
         order = await order_service.get_order(session, callback_data.order_id)
@@ -681,7 +780,8 @@ async def cb_leftovers(callback: CallbackQuery, callback_data: IssueCb, state: F
     await state.set_state(Leftovers.choosing)
     await state.update_data(issue_id=issue.id, qty=qty)
     await callback.message.answer(
-        "Сколько порций осталось? Выберите количество и опубликуйте.",
+        "<b>➕ Дополнительные блюда</b>\nСколько порций можно предложить? Бот выставит их "
+        "во «вне лавки» и опубликует пост — клиенты закажут сами, писать вам не нужно.",
         reply_markup=keyboards.leftovers(issue.items, {int(k): v for k, v in qty.items()}),
     )
     await callback.answer()
@@ -705,28 +805,29 @@ async def cb_leftovers_edit(callback: CallbackQuery, callback_data: LeftCb, stat
         await state.clear()
         await replace_message(callback, "Отменено.")
     elif action == "publish":
-        lines = [(item.name, qty.get(str(item.id), 0)) for item in issue.items if qty.get(str(item.id), 0) > 0]
-        if not lines:
-            await callback.answer("Выберите хотя бы одну порцию.", show_alert=True)
-            return
+        quantities = {int(k): v for k, v in qty.items() if v > 0}
         chat_id = await settings_service.get_group_chat_id(session)
         if chat_id is None:
             await callback.answer("Группа не подключена.", show_alert=True)
             return
-        # Кнопка ведёт на «Контакт для клиентов» из настроек — к шефу,
-        # кто бы ни публиковал пост (раньше вела к публикующему — исправлено).
-        chef_url = await settings_service.get_chef_contact_url(session)
-        if chef_url is None:
-            await callback.answer(
-                "Сначала укажите контакт для клиентов: ⚙️ Настройки → ✏️ Контакт для клиентов.", show_alert=True
-            )
-            return
-        kb = keyboards.url_button(texts.BTN_WRITE_CHEF, chef_url)
         try:
-            await bot.send_message(chat_id, texts.leftovers_post(lines), reply_markup=kb)
+            items = await issue_service.add_extras(session, issue, quantities)
+        except ServiceError as error:
+            await callback.answer(str(error), show_alert=True)
+            return
+        # «Заказать» ведёт в «🧺 Вне лавки» (/start stock); там, если у клиента
+        # есть заказ в этой лавке, бот спросит «Куда добавить?».
+        me = await bot.me()
+        kb = keyboards.order_button(publisher.deep_link(me.username, "stock"))
+        try:
+            await bot.send_message(chat_id, texts.extras_post(items), reply_markup=kb)
         except TelegramAPIError as error:
-            await callback.answer(f"Не удалось опубликовать: {error}", show_alert=True)
+            # Порции уже выставлены вне лавки — пост можно повторить оттуда.
+            await callback.answer(f"Порции выставлены, но пост не опубликован: {error}", show_alert=True)
+            await state.clear()
             return
         await state.clear()
-        await replace_message(callback, "🍱 Пост о лишних порциях опубликован.")
+        await replace_message(
+            callback, "➕ Дополнительные блюда выставлены во «🧺 Вне лавки», пост опубликован."
+        )
     await callback.answer()

@@ -24,6 +24,7 @@ from culinary_bot.bot.callbacks import (
     CheckoutCb,
     DeleteMeCb,
     DishCb,
+    ExtraCb,
     FieldCb,
     IssueCb,
     ItemCb,
@@ -403,8 +404,9 @@ def issue(i: Issue) -> InlineKeyboardMarkup:
         add("📋 Заказы", IssueCb(action="orders", issue_id=iid))
         add("📊 Excel", IssueCb(action="excel", issue_id=iid))
         sizes.append(2)
-    if i.status in (IssueStatus.OPEN, IssueStatus.CLOSED):
-        add("🍱 Лишние порции", IssueCb(action="leftovers", issue_id=iid))
+    if i.status == IssueStatus.CLOSED:
+        # Только после закрытия приёма: пока лавка открыта, всё заказывают из неё.
+        add("➕ Дополнительные блюда", IssueCb(action="leftovers", issue_id=iid))
         sizes.append(1)
     if i.status == IssueStatus.OPEN:
         add("🔒 Закрыть приём", IssueCb(action="close", issue_id=iid))
@@ -453,6 +455,16 @@ def price_apply(item_id: int, cents: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text="Да, ко всем заказам", callback_data=ItemCb(action="price_all", item_id=item_id, value=cents))
     kb.button(text="Нет, только для новых", callback_data=ItemCb(action="price_new", item_id=item_id, value=cents))
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def price_check(issue_id: int, dish_id: int) -> InlineKeyboardMarkup:
+    """«Цена такая — верно?» при добавлении блюда в выпуск (решение от 26.11)."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Да, добавить", callback_data=IssueCb(action="add_dish", issue_id=issue_id, dish_id=dish_id))
+    kb.button(text="✏️ Исправить цену", callback_data=IssueCb(action="fix_price", issue_id=issue_id, dish_id=dish_id))
+    kb.button(text="← К выбору", callback_data=IssueCb(action="add", issue_id=issue_id))
     kb.adjust(1)
     return kb.as_markup()
 
@@ -514,7 +526,7 @@ def admin_order(o: Order) -> InlineKeyboardMarkup:
 
 def cancel_notification(order_id: int, issue_id: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text="🍱 Предложить эти порции в группе", callback_data=IssueCb(action="leftovers_from", issue_id=issue_id, order_id=order_id))
+    kb.button(text="➕ Предложить как дополнительные блюда", callback_data=IssueCb(action="leftovers_from", issue_id=issue_id, order_id=order_id))
     return kb.as_markup()
 
 
@@ -537,7 +549,7 @@ def leftovers(items: list[IssueItem], qty: dict[int, int], page: int = 0) -> Inl
     nav = nav_row(page, pages, lambda p: LeftCb(action="page", page=p))
     if nav:
         kb.row(*nav)
-    kb.row(InlineKeyboardButton(text="📣 Опубликовать в группе", callback_data=LeftCb(action="publish").pack()))
+    kb.row(InlineKeyboardButton(text="📣 Выставить и опубликовать", callback_data=LeftCb(action="publish").pack()))
     kb.row(InlineKeyboardButton(text="Отмена", callback_data=LeftCb(action="cancel").pack()))
     return kb.as_markup()
 
@@ -699,7 +711,7 @@ def stock_admin(issue: Issue) -> InlineKeyboardMarkup:
     kb.button(text="📣 Опубликовать пост", callback_data=IssueCb(action="stock_post", issue_id=issue.id))
     kb.button(text="📋 Заказы", callback_data=IssueCb(action="orders", issue_id=issue.id))
     kb.button(text="📊 Excel", callback_data=IssueCb(action="excel", issue_id=issue.id))
-    kb.button(text="📣 Сообщить всем с заказами", callback_data=IssueCb(action="stock_notify", issue_id=issue.id))
+    kb.button(text="📣 Сообщить о готовности заказов", callback_data=IssueCb(action="stock_notify", issue_id=issue.id))
     kb.button(text="✅ Все заказы отданы", callback_data=IssueCb(action="stock_done", issue_id=issue.id))
     kb.button(text="← Админка", callback_data=AdmCb(section="home"))
     kb.adjust(2, *([1] * len(issue.items)), 2, 2, 1, 1, 1)
@@ -734,7 +746,8 @@ def dish_picker(
         if d.id in reasons:
             text += f" · {reasons[d.id]}"
         if mode == "lavka":
-            cb = IssueCb(action="add_dish", issue_id=issue_id, dish_id=d.id)
+            # Сначала проверка цены (pick_dish), а не сразу добавление.
+            cb = IssueCb(action="pick_dish", issue_id=issue_id, dish_id=d.id)
         elif mode == "stock":
             cb = IssueCb(action="stock_dish", issue_id=issue_id, dish_id=d.id)
         else:
@@ -764,4 +777,27 @@ def dish_picker(
     elif mode == "stock":
         kb.row(InlineKeyboardButton(text="➕ Новое блюдо в каталог", callback_data=DishCb(action="new").pack()))
         kb.row(InlineKeyboardButton(text="← Назад", callback_data=AdmCb(section="stock").pack()))
+    return kb.as_markup()
+
+
+
+def extras_finish(issue_id: int) -> InlineKeyboardMarkup:
+    """Оставить / убрать / выбрать неразобранные дополнительные блюда."""
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Оставить все", callback_data=ExtraCb(action="keep_all", issue_id=issue_id))
+    kb.button(text="🗑 Убрать все", callback_data=ExtraCb(action="drop_all", issue_id=issue_id))
+    kb.button(text="Выбрать", callback_data=ExtraCb(action="choose", issue_id=issue_id))
+    kb.adjust(2, 1)
+    return kb.as_markup()
+
+
+def extras_choose(issue_id: int, items: list[IssueItem]) -> InlineKeyboardMarkup:
+    """По каждому блюду: «Оставить» или «Убрать» — применяется сразу."""
+    kb = InlineKeyboardBuilder()
+    for item in items:
+        kb.row(InlineKeyboardButton(text=f"{item.name} — {item.stock_left}", callback_data=ExtraCb(action="noop").pack()))
+        kb.row(
+            InlineKeyboardButton(text="✅ Оставить", callback_data=ExtraCb(action="keep", issue_id=issue_id, item_id=item.id).pack()),
+            InlineKeyboardButton(text="🗑 Убрать", callback_data=ExtraCb(action="drop", issue_id=issue_id, item_id=item.id).pack()),
+        )
     return kb.as_markup()

@@ -45,14 +45,27 @@ def deep_link(bot_username: str, payload: str) -> str:
     return f"https://t.me/{bot_username}?start={payload}"
 
 
-async def send_safe(bot: Bot, chat_id: int, text: str, reply_markup: InlineKeyboardMarkup | None = None) -> bool:
+async def send_safe(
+    bot: Bot,
+    chat_id: int,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+    photo: str | None = None,
+    reply_to: int | None = None,
+) -> bool:
     """
     Отправить сообщение, не падая при ошибке. Возвращает True, если доставлено.
 
+    photo — file_id фото: тогда текст идёт подписью к нему (до 1024 символов,
+    длиннее — отправим текстом без фото, чтобы сообщение всё-таки дошло).
+    reply_to — id сообщения, на которое отвечаем (в группе — на пост лавки).
     Типичная ошибка — клиент заблокировал бота: Telegram отвечает 403 Forbidden.
     """
     try:
-        await bot.send_message(chat_id, text, reply_markup=reply_markup)
+        if photo and texts.visible_length(text) <= CAPTION_LIMIT:
+            await bot.send_photo(chat_id, photo, caption=text, reply_markup=reply_markup, reply_to_message_id=reply_to)
+        else:
+            await bot.send_message(chat_id, text, reply_markup=reply_markup, reply_to_message_id=reply_to)
         return True
     except TelegramAPIError as error:
         log.warning("Не удалось отправить сообщение в %s: %s", chat_id, error)
@@ -128,6 +141,25 @@ async def send_menu_post(bot: Bot, chat_id: int, issue: Issue, bot_username: str
     text_msg = await bot.send_message(chat_id, plain_text, reply_markup=button)
     ids.append(text_msg.message_id)
     return ids, text_msg.message_id, False
+
+
+async def announce_new_item(bot: Bot, session: AsyncSession, issue: Issue, item) -> bool:
+    """
+    Блюдо добавили в уже опубликованную лавку — ответить на пост в группе
+    отдельным сообщением с фото и кнопкой «Заказать» (решение от 26.11).
+
+    Почему не править пост: в отправленный альбом Telegram не даёт добавить
+    фото, а удалить и опубликовать заново — пост «прыгнет» вниз и потеряет реакции.
+    """
+    chat_id = await settings_service.get_group_chat_id(session)
+    if chat_id is None or issue.group_text_message_id is None:
+        return False  # пост ещё не опубликован — новое блюдо войдёт в него
+    me = await bot.me()  # aiogram запоминает ответ, повторного запроса нет
+    link = deep_link(me.username, menu_payload(issue))
+    text = texts.new_item_post(item)
+    return await send_safe(
+        bot, chat_id, text, keyboards.order_button(link), photo=item.photo_file_id, reply_to=issue.group_text_message_id
+    )
 
 
 async def update_menu_post(bot: Bot, session: AsyncSession, issue: Issue, bot_username: str) -> str:

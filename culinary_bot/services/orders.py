@@ -194,6 +194,24 @@ async def pending_stock_count(session: AsyncSession, stock: Issue) -> int:
     return count or 0
 
 
+async def lavka_orders_with_stock(session: AsyncSession, stock: Issue) -> list[Order]:
+    """
+    Неотданные заказы ЛАВОК, к которым прицеплены блюда вне лавки («К моему заказу»).
+
+    Они едут вместе с лавкой, поэтому «📣 Сообщить о готовности заказов» вне лавки
+    их не касается — о выдаче напишет «📣 Объявить выдачу» лавки. Счётчик нужен,
+    чтобы шеф видел: блюда не пропали.
+    """
+    result = await session.scalars(
+        select(Order)
+        .join(OrderItem, OrderItem.order_id == Order.id)
+        .join(IssueItem, IssueItem.id == OrderItem.issue_item_id)
+        .where(IssueItem.issue_id == stock.id, Order.issue_id != stock.id, Order.status == OrderStatus.ACCEPTED)
+        .distinct()
+    )
+    return list(result)
+
+
 async def attachable_orders(session: AsyncSession, customer: Customer) -> list[Order]:
     """
     Заказы клиента в лавках, к которым можно добавить блюда вне лавки:

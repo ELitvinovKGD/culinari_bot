@@ -131,6 +131,64 @@ async def add_stock_dish(session: AsyncSession, issue: Issue, dish: Dish, quanti
     return item
 
 
+async def add_extras(session: AsyncSession, lavka: Issue, quantities: dict[int, int]) -> list[IssueItem]:
+    """
+    «➕ Дополнительные блюда» (решение от 26.11): порции из закрытой лавки
+    выставляются во «вне лавки» с остатком — клиенты заказывают их сами
+    через бота, а не пишут шефу.
+
+    quantities: id позиции лавки → сколько порций. Цена берётся ИЗ ЛАВКИ
+    (её клиент видел в посте). Если блюдо уже было вне лавки — остаток пополняется.
+    Возвращает позиции вне лавки.
+    """
+    if lavka.kind != IssueKind.LAVKA:
+        raise ServiceError("Дополнительные блюда — только из лавки.")
+    stock = await get_stock_issue(session)
+    by_id = {item.id: item for item in lavka.items}
+    result = []
+    for lavka_item_id, qty in quantities.items():
+        source = by_id.get(lavka_item_id)
+        if source is None or qty <= 0:
+            continue
+        dish = await session.get(Dish, source.dish_id)
+        before = next((i for i in stock.items if i.dish_id == source.dish_id), None)
+        was_on_sale = before is not None and before.is_active and (before.stock_left or 0) > 0
+        item = await add_stock_dish(session, stock, dish, qty)
+        item.price_cents = source.price_cents
+        # Помечаем «из лавки», только если блюда не было в продаже: банку
+        # наливки, которую шеф выставил сам, при завершении лавки не трогаем.
+        if not was_on_sale:
+            item.extra_from_issue_id = lavka.id
+        result.append(item)
+    if not result:
+        raise ServiceError("Выберите хотя бы одну порцию.")
+    await session.flush()
+    return result
+
+
+async def unsold_extras(session: AsyncSession, lavka: Issue) -> list[IssueItem]:
+    """Дополнительные блюда этой лавки, которые ещё продаются (для вопроса при завершении)."""
+    stock = await find_stock_issue(session)
+    if stock is None:
+        return []
+    return [i for i in stock_available(stock) if i.extra_from_issue_id == lavka.id]
+
+
+def keep_extra(item: IssueItem) -> None:
+    """Оставить порции вне лавки: дальше это обычное блюдо вне лавки."""
+    item.extra_from_issue_id = None
+
+
+def drop_extra(item: IssueItem) -> None:
+    """
+    Убрать порции из продажи. Снимаем с продажи, а не удаляем: блюдо может
+    лежать в чьей-то корзине или быть в заказах — им нужна эта строка.
+    """
+    item.is_active = False
+    item.stock_left = 0
+    item.extra_from_issue_id = None
+
+
 def set_stock(item: IssueItem, quantity: int) -> None:
     """Задать остаток вручную («осталось 3»). Бронь в корзинах не трогаем."""
     if not item.is_stock:

@@ -83,7 +83,7 @@ Telegram ──► bot/ (обработчики, кнопки)  ──►  servi
 | `bot/handlers/admin_setup.py` | Мастер первой настройки и чек-лист готовности |
 | `bot/handlers/admin_fields.py` | Универсальная правка полей |
 | `bot/handlers/admin_catalog.py` | Каталог и создание блюда |
-| `bot/handlers/admin_issues.py` | Выпуски, публикация, закрытие, лишние порции |
+| `bot/handlers/admin_issues.py` | Выпуски, проверка цены, публикация, закрытие, дополнительные блюда |
 | `bot/handlers/admin_orders.py` | Заказ в админке, позиции шефа |
 | `bot/handlers/group.py` | `/connect` в группе |
 

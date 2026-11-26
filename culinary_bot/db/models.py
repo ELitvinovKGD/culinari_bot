@@ -338,6 +338,12 @@ class IssueItem(Base):
     # возвращается, если бронь снята или заказ отменён.
     stock_left: Mapped[int | None] = mapped_column(Integer)
 
+    # «➕ Дополнительные блюда»: из какой лавки пришли эти порции вне лавки.
+    # Нужно, чтобы при «Завершить выпуск» спросить шефа, что делать с
+    # неразобранными. Пусто — обычное блюдо вне лавки (наливка между лавками).
+    # Без внешнего ключа: опубликованная лавка из базы не удаляется.
+    extra_from_issue_id: Mapped[int | None] = mapped_column(Integer)
+
     issue: Mapped[Issue] = relationship(back_populates="items", lazy="selectin")
 
     @property

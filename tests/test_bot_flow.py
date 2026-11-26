@@ -329,7 +329,7 @@ async def test_full_issue_flow(harness):
 
 async def test_admin_tools(harness):
     """Правки открытого выпуска, позиции от шефа, лишние порции, приглашение админа."""
-    from culinary_bot.bot.callbacks import AdminsCb, AOrderCb, ItemCb, LeftCb
+    from culinary_bot.bot.callbacks import AdminsCb, AOrderCb, ItemCb
     from culinary_bot.db.models import AdminInvite
 
     h = harness
@@ -387,20 +387,9 @@ async def test_admin_tools(harness):
     async with h.maker() as s:
         assert (await s.get(Order, order.id)).total_cents == 2400 + 800
 
-    # Лишние порции: без контакта шефа публикация не проходит.
+    # Дополнительные блюда — только после закрытия приёма (пока лавка открыта — заказывают из неё).
     await h.click(OWNER, IssueCb(action="leftovers_from", issue_id=issue.id, order_id=order.id))
-    await h.click(OWNER, LeftCb(action="plus", item_id=item.id))
-    await h.click(OWNER, LeftCb(action="publish"))
-    assert not any("Остались свободные порции" in t for t in h.fake.texts())
-    # Указываем контакт в настройках — кнопка «Написать шефу» ведёт к шефу.
-    await h.click(OWNER, FieldCb(entity="setting", field="chef_contact"))
-    await h.send(OWNER, "https://t.me/chef_anton")
-    await h.click(OWNER, IssueCb(action="leftovers_from", issue_id=issue.id, order_id=order.id))
-    await h.click(OWNER, LeftCb(action="plus", item_id=item.id))
-    await h.click(OWNER, LeftCb(action="publish"))
-    assert any("Остались свободные порции" in t and "— 3" in t for t in h.fake.texts())
-    leftovers_call = [c for c in h.fake.calls if "Остались свободные порции" in (getattr(c, "text", "") or "")][-1]
-    assert leftovers_call.reply_markup.inline_keyboard[0][0].url == "https://t.me/chef_anton"
+    assert any("после закрытия приёма" in t for t in h.fake.texts())
 
     # Снять блюдо с продажи — клиент получает уведомление.
     await h.click(OWNER, ItemCb(action="off", item_id=item.id))
@@ -865,8 +854,106 @@ async def test_long_lists(harness):
     await h.click(OWNER, IssueCb(action="orders", issue_id=lavka_id, show_all=1))
     assert "Все: 40" in h.fake.texts()[-1]
 
-    # Лишние порции при 30 блюдах — страницами.
+    # Дополнительные блюда при 30 блюдах — страницами (доступны после закрытия приёма).
+    async with h.maker() as s:
+        await issue_service.close_issue(s, await issue_service.get_issue(s, lavka_id))
+        await s.commit()
     await h.click(OWNER, IssueCb(action="leftovers", issue_id=lavka_id))
     from culinary_bot.bot.callbacks import LeftCb
 
     await h.click(OWNER, LeftCb(action="page", page=2))
+
+
+
+async def test_extra_dishes(harness):
+    """
+    Решения от 26.11: проверка цены при добавлении блюда в выпуск, новое блюдо
+    с фото (клиенту и ответом на пост в группе), «➕ Дополнительные блюда»
+    через «вне лавки», вопрос при завершении, «Сообщить о готовности заказов».
+    """
+    from aiogram.methods import SendPhoto
+
+    from culinary_bot.bot.callbacks import ExtraCb, LeftCb, StockCb
+    from culinary_bot.db.models import Dish, IssueItem
+    from culinary_bot.services import cart as cart_service
+    from culinary_bot.services import catalog as catalog_service
+    from culinary_bot.services import customers as customer_service
+    from culinary_bot.services import issues as issue_service
+    from culinary_bot.services import orders as order_service
+
+    h = harness
+    await h.send(OWNER, "/connect", chat_id=GROUP)
+    async with h.maker() as s:
+        soup = await catalog_service.create_dish(s, name="Суп", price_cents=1000)
+        salad = await catalog_service.create_dish(s, name="Салат", price_cents=1200, photo_file_id="PHOTO_SALAD")
+        lavka = await issue_service.create_draft(s, "Лавка")
+        await issue_service.add_dish_to_issue(s, lavka, soup)
+        await issue_service.open_issue(s, lavka)
+        lavka.group_text_message_id = 777  # как будто пост уже опубликован
+        eva = await customer_service.get_or_create(s, CLIENT, "eva")
+        customer_service.save_contact(eva, name="Ева", phone="555123456", delivery_type="delivery", address="Будва 1")
+        eva.privacy_accepted = True
+        await cart_service.change_quantity(s, eva, lavka.items[0], +1)
+        eva_order = await order_service.place_order(s, eva, lavka, comment=None)
+        await s.commit()
+        lavka_id, salad_id, eva_order_id = lavka.id, salad.id, eva_order.id
+
+    # 1. Выбор блюда → «Цена — верно?» → исправить → цена в каталоге и в выпуске.
+    await h.click(OWNER, IssueCb(action="pick_dish", issue_id=lavka_id, dish_id=salad_id))
+    assert "— верно?" in h.fake.texts()[-1]
+    await h.click(OWNER, IssueCb(action="fix_price", issue_id=lavka_id, dish_id=salad_id))
+    await h.send(OWNER, "abc")  # не число — переспросит, а не упадёт
+    await h.send(OWNER, "13")
+    async with h.maker() as s:
+        assert (await s.get(Dish, salad_id)).price_cents == 1300
+        lavka = await issue_service.get_issue(s, lavka_id)
+        salad_item = next(i for i in lavka.items if i.dish_id == salad_id)
+        assert salad_item.price_cents == 1300
+        salad_item_id = salad_item.id
+
+    # 2. Новое блюдо — клиенту с фото, в группу — ответом на пост, с фото.
+    photos = [c for c in h.fake.calls if isinstance(c, SendPhoto) and c.photo == "PHOTO_SALAD"]
+    assert any(c.chat_id == CLIENT and "добавили новое блюдо" in c.caption for c in photos)
+    assert any(c.chat_id == GROUP and c.reply_to_message_id == 777 and "Новое в лавке" in c.caption for c in photos)
+
+    # 3. Пока приём открыт — дополнительных блюд нет; закрыли — есть.
+    await h.click(OWNER, IssueCb(action="leftovers", issue_id=lavka_id))
+    assert "после закрытия приёма" in h.fake.texts()[-1]
+    async with h.maker() as s:
+        await issue_service.close_issue(s, await issue_service.get_issue(s, lavka_id))
+        await s.commit()
+    await h.click(OWNER, IssueCb(action="leftovers", issue_id=lavka_id))
+    await h.click(OWNER, LeftCb(action="plus", item_id=salad_item_id))
+    await h.click(OWNER, LeftCb(action="plus", item_id=salad_item_id))
+    await h.click(OWNER, LeftCb(action="publish"))
+    post = [c for c in h.fake.calls if "дополнительные блюда" in (getattr(c, "text", "") or "")][-1]
+    assert post.chat_id == GROUP and "осталось 2" in post.text
+    assert post.reply_markup.inline_keyboard[0][0].url.endswith("start=stock")
+    async with h.maker() as s:
+        stock = await issue_service.find_stock_issue(s)
+        extra = next(i for i in stock.items if i.dish_id == salad_id)
+        assert extra.stock_left == 2 and extra.price_cents == 1300 and extra.extra_from_issue_id == lavka_id
+        extra_id, stock_id = extra.id, stock.id
+
+    # 4. Клиент заказывает дополнительное блюдо — оно прицепляется к его заказу лавки.
+    await h.click(CLIENT, StockCb(action="open"))
+    await h.click(CLIENT, StockCb(action="plus", item_id=extra_id))
+    await h.click(CLIENT, StockCb(action="checkout"))
+    await h.click(CLIENT, StockCb(action="pick", order_id=eva_order_id))
+    await h.click(CLIENT, StockCb(action="to", order_id=eva_order_id))
+    await h.click(CLIENT, CheckoutCb(action="skip"))
+    assert "Добавлено к заказу" in h.fake.texts()[-1]
+
+    # 5. «Сообщить о готовности заказов»: отдельных нет — бот объясняет, что едут с лавкой.
+    await h.click(OWNER, IssueCb(action="stock_notify", issue_id=stock_id))
+    assert "едут с лавкой" in h.fake.texts()[-1]
+
+    # 6. Завершить выпуск → вопрос про неразобранное → «Выбрать» → «Убрать».
+    await h.click(OWNER, IssueCb(action="finish_yes", issue_id=lavka_id))
+    assert any("Остались дополнительные блюда" in t and "Салат — 1" in t for t in h.fake.texts())
+    await h.click(OWNER, ExtraCb(action="choose", issue_id=lavka_id))
+    await h.click(OWNER, ExtraCb(action="drop", issue_id=lavka_id, item_id=extra_id))
+    assert "Готово" in h.fake.texts()[-1]
+    async with h.maker() as s:
+        extra = await s.get(IssueItem, extra_id)
+        assert not extra.is_active and extra.stock_left == 0

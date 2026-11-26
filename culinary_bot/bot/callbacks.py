@@ -168,11 +168,22 @@ class AdminsCb(CallbackData, prefix="adms"):
 
 
 class LeftCb(CallbackData, prefix="left"):
-    """Лишние порции: plus, minus, publish, cancel, page, noop."""
+    """Дополнительные блюда (бывшие «лишние порции»): plus, minus, publish, cancel, page, noop."""
 
     action: str
     item_id: int = 0
     page: int = 0
+
+
+class ExtraCb(CallbackData, prefix="extra"):
+    """
+    Неразобранные дополнительные блюда при завершении лавки:
+    keep_all, drop_all, choose, keep, drop (item_id — одна позиция).
+    """
+
+    action: str
+    issue_id: int = 0
+    item_id: int = 0
 
 
 class SetupCb(CallbackData, prefix="setup"):

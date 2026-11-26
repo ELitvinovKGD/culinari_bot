@@ -519,10 +519,26 @@ def my_data_text(customer, recipients: list) -> str:
     return "\n".join(lines)
 
 
-def leftovers_post(lines: list[tuple[str, int]]) -> str:
-    """Пост «Остались порции» в группу."""
-    body = "\n".join(f"• {esc(name)} — {qty}" for name, qty in lines)
-    return f"🍱 <b>Остались свободные порции:</b>\n\n{body}\n\nПишите шефу, пока не разобрали!"
+def extras_post(items: list[IssueItem]) -> str:
+    """
+    Пост «➕ Дополнительные блюда» в группу (решение от 26.11).
+
+    Не «лишние» и не «остатки» — для клиента это звучит как объедки.
+    Кнопка «Заказать» под постом ведёт в «🧺 Вне лавки».
+    """
+    body = "\n".join(
+        f"• {esc(item.name)} — {format_price(item.price_cents)} · осталось {item.stock_left}" for item in items
+    )
+    return f"🍽 <b>Есть возможность заказать дополнительные блюда:</b>\n\n{body}"
+
+
+def extras_finish_question(items: list[IssueItem]) -> str:
+    """При «Завершить выпуск»: что делать с неразобранными дополнительными блюдами."""
+    body = "\n".join(f"• {esc(item.name)} — {item.stock_left}" for item in items)
+    return (
+        f"Остались дополнительные блюда из этой лавки:\n{body}\n\n"
+        "Оставить их вне лавки? Если сроки хранения позволяют — их ещё смогут заказать."
+    )
 
 
 def price_changed(item: IssueItem, old_cents: int, order: Order) -> str:
@@ -545,7 +561,13 @@ def item_removed(item: IssueItem, order: Order) -> str:
 
 
 def item_added(item: IssueItem) -> str:
-    return f"В лавку добавили новое блюдо:\n\n{item_block(item)}"
+    """Клиентам с заказом: в лавку добавили блюдо (приходит с фото, если оно есть)."""
+    return f"🆕 В лавку добавили новое блюдо:\n\n{item_block(item)}"
+
+
+def new_item_post(item: IssueItem) -> str:
+    """Ответ на пост лавки в группе: новое блюдо (с фото и кнопкой «Заказать»)."""
+    return f"🆕 <b>Новое в лавке:</b>\n\n{item_block(item)}"
 
 
 def extra_added(order: Order, name: str, qty: int, price_cents: int) -> str:
@@ -610,7 +632,7 @@ def stock_offer(items: list[IssueItem]) -> str:
     return f"🧺 Ещё у шефа вне лавки: {names}{more}."
 
 
-def stock_for_admin(issue: Issue, pending: int) -> str:
+def stock_for_admin(issue: Issue, pending: int, in_lavka: int = 0) -> str:
     """Экран «🧺 Блюда вне лавки» в админке."""
     lines = [f"🧺 <b>{esc(issue.title)}</b>", ""]
     lines.append(f"<b>Шапка поста:</b> {esc(shorten(issue.header)) if issue.header else '— не заполнена'}")
@@ -620,5 +642,15 @@ def stock_for_admin(issue: Issue, pending: int) -> str:
     for item in issue.items:
         off = "" if item.is_active else " ⛔ снято"
         lines.append(f"{esc(item.name)} — {format_price(item.price_cents)} · осталось {item.stock_left}{off}")
-    lines += ["", f"Неотданных заказов: {pending}"]
+    lines += ["", f"Отдельных неотданных заказов: {pending}"]
+    if in_lavka:
+        lines.append(f"Ещё в заказах лавки: {in_lavka} — едут с лавкой")
     return "\n".join(lines)
+
+
+def stock_only_in_lavka(count: int) -> str:
+    """Alert, когда отдельных заказов вне лавки нет, а прицепленные к лавке — есть (до 200 символов)."""
+    return (
+        f"Отдельных заказов вне лавки нет. Блюда вне лавки есть в заказах лавки ({count}) — "
+        "они едут с лавкой, сообщение придёт с «📣 Объявить выдачу»."
+    )

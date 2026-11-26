@@ -5,7 +5,7 @@
 Шеф:
 - выставляет блюдо и количество, пополняет остаток;
 - пишет шапку и публикует пост в группу (кнопка «Заказать» → «🧺 В наличии»);
-- смотрит заказы, пишет клиентам сам; массово: «📣 Сообщить всем» и «✅ Все отданы».
+- смотрит заказы, пишет клиентам сам; массово: «📣 Сообщить о готовности заказов» и «✅ Все отданы».
 
 Общие экраны (позиция, заказы, Excel, предпросмотр) — в admin_issues.py:
 постоянный выпуск «вне лавки» — тот же Issue, только kind = STOCK.
@@ -44,7 +44,10 @@ async def send_stock(message: Message, session: AsyncSession, issue: Issue | Non
     """Экран «🧺 Блюда вне лавки»."""
     issue = issue or await issue_service.get_stock_issue(session)
     pending = [o for o in await order_service.issue_orders(session, issue) if o.status == OrderStatus.ACCEPTED]
-    await message.answer(texts.stock_for_admin(issue, len(pending)), reply_markup=keyboards.stock_admin(issue))
+    in_lavka = await order_service.lavka_orders_with_stock(session, issue)
+    await message.answer(
+        texts.stock_for_admin(issue, len(pending), len(in_lavka)), reply_markup=keyboards.stock_admin(issue)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -145,9 +148,16 @@ async def pending_orders(session: AsyncSession):
 
 @router.callback_query(IssueCb.filter(F.action == "stock_notify"))
 async def cb_notify(callback: CallbackQuery, state: FSMContext, session: AsyncSession) -> None:
-    """«📣 Сообщить всем с заказами» — один текст всем, у кого есть неотданные заказы."""
+    """
+    «📣 Сообщить о готовности заказов» — один текст всем с отдельными неотданными
+    заказами вне лавки («Капуста готова, завтра развожу»). Блюда, прицепленные
+    к заказам лавки, едут с лавкой — о них бот только напоминает шефу.
+    """
     if not await pending_orders(session):
-        await callback.answer("Неотданных заказов нет.", show_alert=True)
+        stock = await issue_service.get_stock_issue(session)
+        in_lavka = await order_service.lavka_orders_with_stock(session, stock)
+        text = texts.stock_only_in_lavka(len(in_lavka)) if in_lavka else "Неотданных заказов нет."
+        await callback.answer(text, show_alert=True)
         return
     await state.set_state(StockInput.notify_text)
     await callback.message.answer(
